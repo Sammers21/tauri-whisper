@@ -25,4 +25,21 @@ serde_json = "1"
 hound = "3"
 whisper-rs = { path = "../whisper-rs" }
 anyhow = "1.0.98"
+cpal = "0.15"
+tokio = { version = "1.0", features = ["full"] }
+ringbuf = "0.3"
+
+# System audio capture dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "0.3", optional = true }
+ruhear = "0.1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = { version = "0.19", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pulse = { version = "0.5", optional = true }
+
+# Note: Set MACOSX_DEPLOYMENT_TARGET=10.15 environment variable when building on macOS
+# This is required for whisper.cpp's filesystem APIs
 
