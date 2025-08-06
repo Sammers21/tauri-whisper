@@ -93,9 +93,9 @@ struct AudioRecordingState {
 }
 
 // Constants for sliding window
-const WINDOW_SIZE_SECONDS: f32 = 2.0; // Process 3 seconds of audio at a time
-const WINDOW_STEP_SECONDS: f32 = 1.0; // Process every 0.5 seconds
-const MAX_BUFFER_SECONDS: f32 = 10.0; // Keep maximum 10 seconds of audi0
+const WINDOW_SIZE_SECONDS: f32 = 15.0; // Process 3 seconds of audio at a time
+const WINDOW_STEP_SECONDS: f32 = 10.0; // Process every 0.5 seconds
+const MAX_BUFFER_SECONDS: f32 = 20.0; // Keep maximum 10 seconds of audi0
 
 static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::new(|| {
     Arc::new(Mutex::new(AudioRecordingState {
