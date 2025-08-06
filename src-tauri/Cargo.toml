@@ -28,6 +28,9 @@ anyhow = "1.0.98"
 cpal = "0.15"
 tokio = { version = "1.0", features = ["full"] }
 ringbuf = "0.3"
+screencapturekit = "0.3.6"
+core-foundation = "0.10.1"
+core-media-rs = { version = "0.3" }
 
 # System audio capture dependencies
 [target.'cfg(target_os = "macos")'.dependencies]

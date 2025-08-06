@@ -4301,6 +4301,8 @@ name = "tauri-whisper"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "core-foundation",
+ "core-media-rs",
  "cpal",
  "hound",
  "pulse",
