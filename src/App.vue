@@ -249,7 +249,7 @@ async function greet() {
           recording
         </li>
         <li>Click "List Audio Devices" to see available capture methods</li>
-        <li>Transcription appears in real-time every 500ms</li>
+        <li>Transcription appears at sentence boundaries for natural flow</li>
         <li>Check the browser console for detailed audio capture logs</li>
         <li>Click "Stop Recording" when finished</li>
       </ul>
