@@ -24,3 +24,5 @@ dist-ssr
 *.sw?
 *.bin
 *.wav
+*.mlmodel
+*.mlmodelc

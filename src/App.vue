@@ -4,26 +4,39 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const isRecording = ref(false);
-const transcriptText = ref("");
+const transcriptEntries = ref<
+  Array<{ text: string; timing: string; timestamp: Date }>
+>([]);
 const statusMessage = ref("Ready to start recording");
 const isLoading = ref(false);
 const deviceList = ref("");
+const lastTranscriptionTime = ref("");
+const droppedSamplesCount = ref(0);
+const translatedSamplesCount = ref(0);
 
 let unlistenTranscript: UnlistenFn | null = null;
+let droppedSamplesInterval: number | null = null;
 
 onMounted(async () => {
   // Listen for real-time transcript events
   unlistenTranscript = await listen("audio-transcript", (event) => {
-    const newText = event.payload as string;
-    if (newText && newText.trim()) {
-      transcriptText.value += newText + " ";
+    const payload = event.payload as {
+      text: string;
+      timing_ms: number;
+      timing_display: string;
+    };
+    if (payload && payload.text && payload.text.trim()) {
+      transcriptEntries.value.push({
+        text: payload.text,
+        timing: payload.timing_display,
+        timestamp: new Date(),
+      });
+      lastTranscriptionTime.value = payload.timing_display;
       // Auto-scroll to bottom
       setTimeout(() => {
-        const textarea = document.getElementById(
-          "transcript-area"
-        ) as HTMLTextAreaElement;
-        if (textarea) {
-          textarea.scrollTop = textarea.scrollHeight;
+        const transcriptList = document.getElementById("transcript-list");
+        if (transcriptList) {
+          transcriptList.scrollTop = transcriptList.scrollHeight;
         }
       }, 10);
     }
@@ -33,6 +46,9 @@ onMounted(async () => {
 onUnmounted(() => {
   if (unlistenTranscript) {
     unlistenTranscript();
+  }
+  if (droppedSamplesInterval) {
+    clearInterval(droppedSamplesInterval);
   }
 });
 
@@ -54,7 +70,12 @@ async function startRecording() {
     isRecording.value = true;
     statusMessage.value =
       "Recording system audio... Play any audio on your computer";
-    transcriptText.value = ""; // Clear previous transcript
+    transcriptEntries.value = []; // Clear previous transcript
+    droppedSamplesCount.value = 0; // Reset dropped samples counter
+    translatedSamplesCount.value = 0; // Reset translated samples counter
+
+    // Start periodic updates for sample counts
+    droppedSamplesInterval = setInterval(updateSamplesCounts, 1000);
   } catch (error) {
     console.error("Failed to start recording:", error);
     statusMessage.value = `Error: ${error}`;
@@ -72,6 +93,12 @@ async function stopRecording() {
 
     isRecording.value = false;
     statusMessage.value = "Recording stopped";
+
+    // Stop periodic updates
+    if (droppedSamplesInterval) {
+      clearInterval(droppedSamplesInterval);
+      droppedSamplesInterval = null;
+    }
   } catch (error) {
     console.error("Failed to stop recording:", error);
     statusMessage.value = `Error: ${error}`;
@@ -81,7 +108,33 @@ async function stopRecording() {
 }
 
 function clearTranscript() {
-  transcriptText.value = "";
+  transcriptEntries.value = [];
+  lastTranscriptionTime.value = "";
+}
+
+async function updateDroppedSamplesCount() {
+  try {
+    const count = await invoke("get_dropped_samples_count");
+    droppedSamplesCount.value = count as number;
+  } catch (error) {
+    console.error("Failed to get dropped samples count:", error);
+  }
+}
+
+async function updateTranslatedSamplesCount() {
+  try {
+    const count = await invoke("get_translated_samples_count");
+    translatedSamplesCount.value = count as number;
+  } catch (error) {
+    console.error("Failed to get translated samples count:", error);
+  }
+}
+
+async function updateSamplesCounts() {
+  await Promise.all([
+    updateDroppedSamplesCount(),
+    updateTranslatedSamplesCount(),
+  ]);
 }
 
 async function listAudioDevices() {
@@ -111,16 +164,6 @@ function getAudioSetupStatus() {
   }
 
   return "⚠️ Using fallback device - may capture microphone instead";
-}
-
-async function greet() {
-  // Keep the original greet function for testing
-  try {
-    const message = await invoke("greet", { name: "Vue" });
-    statusMessage.value = message as string;
-  } catch (error) {
-    statusMessage.value = `Error: ${error}`;
-  }
 }
 </script>
 
@@ -173,14 +216,49 @@ async function greet() {
 
     <!-- Transcript Display -->
     <div class="transcript-section">
-      <h2>Live Transcript</h2>
-      <textarea
-        id="transcript-area"
-        v-model="transcriptText"
-        readonly
-        placeholder="Your speech will appear here in real-time..."
-        class="transcript-area"
-      ></textarea>
+      <div class="transcript-header">
+        <h2>Live Transcript</h2>
+        <div class="metrics-info">
+          <div v-if="lastTranscriptionTime" class="timing-info">
+            Last transcription:
+            <span class="timing-value">{{ lastTranscriptionTime }}</span>
+          </div>
+          <div v-if="isRecording" class="samples-counters">
+            <div class="translated-samples-info">
+              Translated:
+              <span class="translated-samples-value">
+                {{ translatedSamplesCount.toLocaleString() }}
+              </span>
+            </div>
+            <div class="dropped-samples-info">
+              Dropped:
+              <span
+                class="dropped-samples-value"
+                :class="{ warning: droppedSamplesCount > 0 }"
+              >
+                {{ droppedSamplesCount.toLocaleString() }}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div
+        id="transcript-list"
+        class="transcript-list"
+        v-if="transcriptEntries.length > 0"
+      >
+        <div
+          v-for="(entry, index) in transcriptEntries"
+          :key="index"
+          class="transcript-entry"
+        >
+          <div class="transcript-text">{{ entry.text }}</div>
+          <div class="transcript-timing">{{ entry.timing }}</div>
+        </div>
+      </div>
+      <div v-else class="transcript-placeholder">
+        Your speech will appear here in real-time...
+      </div>
     </div>
 
     <!-- Audio Devices Section -->
@@ -224,12 +302,6 @@ async function greet() {
           </li>
         </ul>
       </div>
-    </div>
-
-    <!-- Test Section -->
-    <div class="test-section">
-      <h3>Test Connection</h3>
-      <button @click="greet" class="test-button">Test Greet</button>
     </div>
 
     <!-- Info Section -->
@@ -390,28 +462,144 @@ h1 {
   margin-bottom: 30px;
 }
 
-.transcript-section h2 {
+.transcript-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   margin-bottom: 15px;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.metrics-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.samples-counters {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.transcript-section h2 {
+  margin: 0;
   color: #2c3e50;
 }
 
-.transcript-area {
+.timing-info {
+  font-size: 14px;
+  color: #7f8c8d;
+  background: #ecf0f1;
+  padding: 5px 10px;
+  border-radius: 15px;
+  border: 1px solid #bdc3c7;
+}
+
+.timing-value {
+  font-weight: 600;
+  color: #2c3e50;
+  font-family: "Courier New", monospace;
+}
+
+.translated-samples-info,
+.dropped-samples-info {
+  font-size: 14px;
+  color: #7f8c8d;
+  background: #ecf0f1;
+  padding: 5px 10px;
+  border-radius: 15px;
+  border: 1px solid #bdc3c7;
+}
+
+.translated-samples-value {
+  font-weight: 600;
+  color: #27ae60;
+  font-family: "Courier New", monospace;
+}
+
+.dropped-samples-value {
+  font-weight: 600;
+  color: #27ae60;
+  font-family: "Courier New", monospace;
+}
+
+.dropped-samples-value.warning {
+  color: #e74c3c;
+  background: #fdf2f2;
+  padding: 2px 6px;
+  border-radius: 8px;
+}
+
+.transcript-list {
+  width: 100%;
+  max-height: 400px;
+  min-height: 200px;
+  padding: 15px;
+  border: 2px solid #e0e0e0;
+  border-radius: 10px;
+  background: #fafafa;
+  box-sizing: border-box;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.transcript-placeholder {
   width: 100%;
   height: 200px;
   padding: 15px;
   border: 2px solid #e0e0e0;
   border-radius: 10px;
-  font-family: "Courier New", monospace;
-  font-size: 14px;
-  line-height: 1.5;
-  resize: vertical;
   background: #fafafa;
   box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7f8c8d;
+  font-style: italic;
 }
 
-.transcript-area:focus {
-  outline: none;
-  border-color: #3498db;
+.transcript-entry {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 15px;
+  padding: 10px;
+  background: white;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}
+
+.transcript-entry:hover {
+  background: #f8f9fa;
+  border-color: #d0d0d0;
+}
+
+.transcript-text {
+  flex: 1;
+  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  color: #2c3e50;
+  word-wrap: break-word;
+}
+
+.transcript-timing {
+  flex-shrink: 0;
+  font-family: "Courier New", monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #7f8c8d;
+  background: #ecf0f1;
+  padding: 3px 8px;
+  border-radius: 12px;
+  border: 1px solid #bdc3c7;
+  white-space: nowrap;
 }
 
 .devices-section {
@@ -491,33 +679,6 @@ h1 {
   text-decoration: underline;
 }
 
-.test-section {
-  margin-bottom: 30px;
-  padding: 15px;
-  background: #ecf0f1;
-  border-radius: 10px;
-}
-
-.test-section h3 {
-  margin-top: 0;
-  margin-bottom: 10px;
-  color: #2c3e50;
-}
-
-.test-button {
-  padding: 8px 16px;
-  background: #3498db;
-  color: white;
-  border: none;
-  border-radius: 5px;
-  cursor: pointer;
-  transition: background 0.3s ease;
-}
-
-.test-button:hover {
-  background: #2980b9;
-}
-
 .info-section {
   background: #e8f4fd;
   padding: 20px;
@@ -555,6 +716,25 @@ h1 {
   .secondary-button {
     width: 100%;
     max-width: 250px;
+  }
+
+  .transcript-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .metrics-info {
+    align-items: stretch;
+  }
+
+  .samples-counters {
+    justify-content: center;
+  }
+
+  .timing-info,
+  .translated-samples-info,
+  .dropped-samples-info {
+    text-align: center;
   }
 }
 </style>

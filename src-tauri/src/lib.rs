@@ -12,6 +12,7 @@ use screencapturekit::{
         output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType, SCStream,
     },
 };
+use serde::Serialize;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::{
     sync::mpsc::{channel, Sender},
@@ -19,6 +20,21 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+
+#[derive(Serialize)]
+struct TranscriptEvent {
+    text: String,
+    timing_ms: f64,
+    timing_display: String,
+}
+
+fn format_timing(seconds: f64) -> String {
+    if seconds >= 1.0 {
+        format!("{:.3}s", seconds)
+    } else {
+        format!("{:.0}ms", seconds * 1000.0)
+    }
+}
 
 // Audio resampling constants
 const SOURCE_SAMPLE_RATE: u32 = 48000;
@@ -67,29 +83,29 @@ fn resample_audio(input: &[f32]) -> Vec<f32> {
 
 // Audio recording control state
 struct AudioRecordingState {
-    audio_buffer: Vec<f32>,  // Rolling buffer of audio samples
-    last_transcript: String, // Keep track of last transcript to detect changes
+    audio_buffer: Vec<f32>, // Rolling buffer of audio samples
     last_process_time: time::Instant,
+    dropped_samples_count: u64, // Track dropped samples due to buffer overflow
+    translated_samples_count: u64, // Track samples that were successfully processed
 
     is_recording: bool,
     stream: Option<SCStream>,
-    sentences_buffer: String, // Buffer for accumulating complete sentences
 }
 
 // Constants for sliding window
-const WINDOW_SIZE_SECONDS: f32 = 10.0; // Process 3 seconds of audio at a time
+const WINDOW_SIZE_SECONDS: f32 = 2.0; // Process 3 seconds of audio at a time
 const WINDOW_STEP_SECONDS: f32 = 1.0; // Process every 0.5 seconds
-const MAX_BUFFER_SECONDS: f32 = 30.0; // Keep maximum 10 seconds of audio
+const MAX_BUFFER_SECONDS: f32 = 10.0; // Keep maximum 10 seconds of audi0
 
 static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::new(|| {
     Arc::new(Mutex::new(AudioRecordingState {
         audio_buffer: Vec::new(),
-        last_transcript: String::new(),
         last_process_time: time::Instant::now(),
+        dropped_samples_count: 0,
+        translated_samples_count: 0,
 
         is_recording: false,
         stream: None,
-        sentences_buffer: String::new(),
     }))
 });
 
@@ -116,50 +132,16 @@ fn get_stream(tx: Sender<CMSampleBuffer>) -> Result<SCStream, CFError> {
     Ok(stream)
 }
 
-// Helper function to detect if text ends with a sentence boundary
-fn ends_with_sentence_boundary(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    // Check for common sentence endings
-    trimmed.ends_with('.')
-        || trimmed.ends_with('!')
-        || trimmed.ends_with('?')
-        || trimmed.ends_with("...")
-        || trimmed.ends_with(';')
-}
-
-// Extract new content from the transcript
-fn extract_new_content(current_transcript: &str, last_transcript: &str) -> Option<String> {
-    if current_transcript.len() > last_transcript.len() {
-        // Find the common prefix
-        let common_len = last_transcript
-            .chars()
-            .zip(current_transcript.chars())
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        let new_content = &current_transcript[common_len..];
-        if !new_content.trim().is_empty() {
-            return Some(new_content.to_string());
-        }
-    }
-    None
-}
-
-fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<String> {
+fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
+    let start_time = time::Instant::now();
     // Resample audio from 48kHz to 16kHz
     let resampled_audio = resample_audio(audio_data);
-
     let model_guard = MODEL.get()?.lock().ok()?;
     let ctx = model_guard.as_ref()?;
     // Create a state
     let mut state = ctx.create_state().ok()?;
     // Create params optimized for real-time transcription
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-    params.set_n_threads(10);
     params.set_translate(false); // Don't translate, just transcribe
     params.set_language(Some("en"));
     params.set_print_special(false);
@@ -167,10 +149,8 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<String> {
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     // Optimize for speed
-    params.set_single_segment(false);
-    params.set_no_speech_thold(0.6); // Higher threshold to filter out noise
-    params.set_suppress_blank(true); // Suppress blank outputs
-                                     // Run the model
+    params.set_single_segment(true);
+    params.set_suppress_blank(false);
     if state.full(params, &resampled_audio).is_err() {
         return None;
     }
@@ -184,7 +164,11 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<String> {
         }
     }
 
-    Some(result.trim().to_string())
+    let elapsed_time = start_time.elapsed().as_secs_f64();
+    let timing_display = format_timing(elapsed_time);
+    println!("Transcription took {}", timing_display);
+
+    Some((result.trim().to_string(), elapsed_time))
 }
 
 #[tauri::command]
@@ -197,9 +181,9 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
         state.is_recording = true;
         state.last_process_time = time::Instant::now();
         state.audio_buffer.clear();
-        state.last_transcript.clear();
-        state.sentences_buffer.clear();
-        // Clone the app_handle to move into the spawned task
+        state.dropped_samples_count = 0; // Reset counter on new recording
+        state.translated_samples_count = 0; // Reset translated samples counter
+                                            // Clone the app_handle to move into the spawned task
         let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
             while let Ok(sample_buffer) = rx.recv() {
@@ -236,17 +220,19 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                             all_samples.push(mixed_sample);
                         }
                     }
-
                     // Add samples to the rolling buffer
                     tokio_state.audio_buffer.extend(all_samples);
-
                     // Keep buffer size under control
                     let max_samples = (SOURCE_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
                     if tokio_state.audio_buffer.len() > max_samples {
                         let excess = tokio_state.audio_buffer.len() - max_samples;
+                        tokio_state.dropped_samples_count += excess as u64;
+                        println!(
+                            "ERROR: Dropping {} samples (total dropped: {})",
+                            excess, tokio_state.dropped_samples_count
+                        );
                         tokio_state.audio_buffer.drain(0..excess);
                     }
-
                     // Process with sliding window at regular intervals
                     if tokio_state.last_process_time.elapsed().as_secs_f32() >= WINDOW_STEP_SECONDS
                     {
@@ -261,59 +247,30 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                                 .saturating_sub(window_samples);
                             let audio_window = &tokio_state.audio_buffer[start_idx..];
                             println!("Processing window of {} samples", audio_window.len());
-                            if let Some(transcript) = transcribe_audio_chunk(audio_window) {
-                                if !transcript.trim().is_empty() {
-                                    // Extract only the new content
-                                    if let Some(new_content) = extract_new_content(
-                                        &transcript,
-                                        &tokio_state.last_transcript,
-                                    ) {
-                                        println!("New content: {}", new_content);
-                                        // Add new content to sentence buffer
-                                        tokio_state.sentences_buffer.push_str(&new_content);
-                                        // Check if we have complete sentences
-                                        if ends_with_sentence_boundary(
-                                            &tokio_state.sentences_buffer,
-                                        ) {
-                                            // Emit the complete sentences
-                                            let sentences =
-                                                tokio_state.sentences_buffer.trim().to_string();
-                                            if !sentences.is_empty() {
-                                                if let Err(e) = app_handle_clone
-                                                    .emit("audio-transcript", &sentences)
-                                                {
-                                                    eprintln!(
-                                                        "Failed to emit transcript event: {:?}",
-                                                        e
-                                                    );
-                                                } else {
-                                                    println!("Sentences emitted: {}", sentences);
-                                                }
-                                                tokio_state.sentences_buffer.clear();
-                                            }
-                                        } else if tokio_state.sentences_buffer.len() > 200 {
-                                            // Emit long incomplete sentences to avoid too much buffering
-                                            let partial =
-                                                tokio_state.sentences_buffer.trim().to_string();
-                                            if !partial.is_empty() {
-                                                if let Err(e) = app_handle_clone
-                                                    .emit("audio-transcript", &partial)
-                                                {
-                                                    eprintln!(
-                                                        "Failed to emit transcript event: {:?}",
-                                                        e
-                                                    );
-                                                }
-                                                tokio_state.sentences_buffer.clear();
-                                            }
-                                        }
-                                    }
+                            if let Some((transcript, timing_seconds)) =
+                                transcribe_audio_chunk(audio_window)
+                            {
+                                // Count translated samples (successful processing)
+                                tokio_state.translated_samples_count += audio_window.len() as u64;
 
-                                    // Update last transcript
-                                    tokio_state.last_transcript = transcript;
+                                if !transcript.trim().is_empty() {
+                                    let transcript_event = TranscriptEvent {
+                                        text: transcript,
+                                        timing_ms: timing_seconds * 1000.0,
+                                        timing_display: format_timing(timing_seconds),
+                                    };
+                                    if let Err(e) =
+                                        app_handle_clone.emit("audio-transcript", &transcript_event)
+                                    {
+                                        eprintln!("Failed to emit transcript event: {:?}", e);
+                                    } else {
+                                        println!(
+                                            "Transcript emitted: {} (took {})",
+                                            transcript_event.text, transcript_event.timing_display
+                                        );
+                                    }
                                 }
                             }
-
                             tokio_state.last_process_time = time::Instant::now();
                         }
                     }
@@ -335,12 +292,37 @@ async fn stop_recording() -> Result<String, String> {
         state.is_recording = false;
         state.stream = None;
         state.audio_buffer.clear();
-        state.last_transcript.clear();
-        state.sentences_buffer.clear();
     } else {
         return Err("Failed to acquire recording state lock".to_string());
     }
     Ok("Recording stopped".to_string())
+}
+
+#[tauri::command]
+async fn get_dropped_samples_count() -> Result<u64, String> {
+    if let Ok(state) = RECORDING_STATE.lock() {
+        Ok(state.dropped_samples_count)
+    } else {
+        Err("Failed to acquire recording state lock".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_translated_samples_count() -> Result<u64, String> {
+    if let Ok(state) = RECORDING_STATE.lock() {
+        Ok(state.translated_samples_count)
+    } else {
+        Err("Failed to acquire recording state lock".to_string())
+    }
+}
+
+#[tauri::command]
+async fn list_audio_devices() -> Result<String, String> {
+    // For macOS with ScreenCaptureKit, system audio capture is built-in
+    Ok(
+        "✅ System audio capture available via ScreenCaptureKit\nNo additional setup required."
+            .to_string(),
+    )
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -348,7 +330,13 @@ pub fn run() {
     init();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![start_recording, stop_recording,])
+        .invoke_handler(tauri::generate_handler![
+            start_recording,
+            stop_recording,
+            get_dropped_samples_count,
+            get_translated_samples_count,
+            list_audio_devices,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
