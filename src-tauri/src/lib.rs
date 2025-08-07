@@ -16,6 +16,7 @@ use screencapturekit::{
 use serde::Serialize;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::{
+    collections::HashSet,
     sync::mpsc::{channel, Sender},
     time,
 };
@@ -129,7 +130,7 @@ struct AudioRecordingState {
     last_process_time: time::Instant,
     dropped_samples_count: u64, // Track dropped samples due to buffer overflow
     translated_samples_count: u64, // Track samples that were successfully processed
-
+    last_result_of_transcription: String,
     is_recording: bool,
     stream: Option<SCStream>,
 }
@@ -148,7 +149,7 @@ static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::ne
         last_process_time: time::Instant::now(),
         dropped_samples_count: 0,
         translated_samples_count: 0,
-
+        last_result_of_transcription: String::new(),
         is_recording: false,
         stream: None,
     }))
@@ -210,6 +211,41 @@ fn extract_audio_samples_from_buffer(sample_buffer: &CMSampleBuffer) -> Vec<f32>
     all_samples
 }
 
+fn remove_common_words(current_transcript: &str, last_transcript: &str) -> (String, bool) {
+    // If there's no previous transcript, return the current one as-is
+    if last_transcript.trim().is_empty() {
+        return (current_transcript.to_string(), false);
+    }
+
+    // Split both transcripts into words (lowercase for comparison)
+    let current_words: Vec<&str> = current_transcript.split_whitespace().collect();
+    let last_transcript_lower = last_transcript.to_lowercase();
+    let last_words: HashSet<&str> = last_transcript_lower.split_whitespace().collect();
+
+    // Filter out words that appeared in the last transcript
+    let mut filtered_words = Vec::new();
+    let mut words_removed = false;
+
+    for word in current_words {
+        let word_lower = word.to_lowercase();
+        if !last_words.contains(word_lower.as_str()) {
+            filtered_words.push(word);
+        } else {
+            words_removed = true;
+        }
+    }
+
+    // Join the filtered words back into a string
+    let result = filtered_words.join(" ");
+
+    // If we removed all words, return the original to avoid empty results
+    if result.trim().is_empty() && !current_transcript.trim().is_empty() {
+        return (current_transcript.to_string(), false);
+    }
+
+    (result, words_removed)
+}
+
 fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let start_time = time::Instant::now();
     // Audio data is already resampled to 16kHz in the ring buffer
@@ -219,8 +255,8 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let mut state = ctx.create_state().ok()?;
     // Create params optimized for real-time transcription
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-    params.set_translate(true);
-    params.set_language(Some("en"));
+    params.set_translate(false);
+    params.set_language(Some("ru"));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -267,25 +303,6 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                     // Process with sliding window at regular intervals
                     if tokio_state.last_process_time.elapsed().as_secs_f32() >= WINDOW_STEP_SECONDS
                     {
-                        // Check if we're falling behind in processing
-                        let buffer_capacity =
-                            (TARGET_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
-                        let buffer_usage =
-                            tokio_state.audio_buffer.len() as f32 / buffer_capacity as f32;
-                        // If buffer is getting too full, we're effectively dropping audio by not keeping up
-                        if buffer_usage > 0.95 {
-                            let overflow_samples = tokio_state
-                                .audio_buffer
-                                .len()
-                                .saturating_sub((buffer_capacity as f32 * 0.8) as usize);
-                            if overflow_samples > 0 {
-                                tokio_state.dropped_samples_count += overflow_samples as u64;
-                                println!(
-                                    "WARN: Processing falling behind, buffer {}% full - effectively dropping {} samples (total dropped: {})",
-                                    (buffer_usage * 100.0) as u32, overflow_samples, tokio_state.dropped_samples_count
-                                );
-                            }
-                        }
                         let audio_window =
                             tokio_state.audio_buffer.get_latest_samples(WINDOW_SAMPLES);
                         println!("Processing window of {} samples", audio_window.len());
@@ -294,9 +311,14 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                         {
                             // Count translated samples (successful processing)
                             tokio_state.translated_samples_count += audio_window.len() as u64;
+                            let (to_send, _common_words_removed) = remove_common_words(
+                                &transcript,
+                                &tokio_state.last_result_of_transcription,
+                            );
+                            tokio_state.last_result_of_transcription = transcript.clone();
                             if !transcript.trim().is_empty() {
                                 let transcript_event = TranscriptEvent {
-                                    text: transcript,
+                                    text: to_send,
                                     timing_ms: timing_seconds * 1000.0,
                                     timing_display: format_timing(timing_seconds),
                                 };
