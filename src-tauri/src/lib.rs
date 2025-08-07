@@ -41,6 +41,7 @@ fn format_timing(seconds: f64) -> String {
 const SOURCE_SAMPLE_RATE: u32 = 48000;
 const TARGET_SAMPLE_RATE: u32 = 16000;
 const RESAMPLE_RATIO: f32 = TARGET_SAMPLE_RATE as f32 / SOURCE_SAMPLE_RATE as f32;
+const WINDOW_SAMPLES: usize = (WINDOW_SIZE_SECONDS * TARGET_SAMPLE_RATE as f32) as usize;
 
 // Audio ring buffer wrapper for convenience
 struct AudioRingBuffer {
@@ -75,13 +76,12 @@ impl AudioRingBuffer {
     }
 
     fn get_latest_samples(&self, count: usize) -> Vec<f32> {
-        if count > self.buffer.len() {
+        let total_len = self.buffer.len();
+        if total_len == 0 {
             return Vec::new();
         }
-
-        let total_len = self.buffer.len();
-        let start_idx = total_len.saturating_sub(count);
-
+        let samples_to_take = count.min(total_len);
+        let start_idx = total_len.saturating_sub(samples_to_take);
         self.buffer.iter().skip(start_idx).copied().collect()
     }
 }
@@ -135,9 +135,9 @@ struct AudioRecordingState {
 }
 
 // Constants for sliding window
-const WINDOW_SIZE_SECONDS: f32 = 15.0; // Process 3 seconds of audio at a time
-const WINDOW_STEP_SECONDS: f32 = 10.0; // Process every 0.5 seconds
-const MAX_BUFFER_SECONDS: f32 = 20.0; // Keep maximum 10 seconds of audi0
+const WINDOW_SIZE_SECONDS: f32 = 15.0;
+const WINDOW_STEP_SECONDS: f32 = 2.0;
+const MAX_BUFFER_SECONDS: f32 = 20.0;
 
 static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::new(|| {
     // Calculate ring buffer capacity for resampled audio (16kHz)
@@ -169,13 +169,45 @@ fn init() {
     MODEL.get_or_init(|| Mutex::new(Some(ctx)));
 }
 
-fn get_stream(tx: Sender<CMSampleBuffer>) -> Result<SCStream, CFError> {
+fn start_mac_os_stream(tx: Sender<CMSampleBuffer>) -> Result<SCStream, CFError> {
     let config = SCStreamConfiguration::new().set_captures_audio(true)?;
     let display = SCShareableContent::get().unwrap().displays().remove(0);
     let filter = SCContentFilter::new().with_display_excluding_windows(&display, &[]);
     let mut stream = SCStream::new(&filter, &config);
     stream.add_output_handler(AudioStreamOutput { sender: tx }, SCStreamOutputType::Audio);
     Ok(stream)
+}
+
+fn extract_audio_samples_from_buffer(sample_buffer: &CMSampleBuffer) -> Vec<f32> {
+    let mut all_samples = Vec::new();
+    let buffer_list = sample_buffer.get_audio_buffer_list().expect("should work");
+    // Process all audio buffers and mix them properly
+    for buffer_index in 0..buffer_list.num_buffers() {
+        let buffer = buffer_list.get(buffer_index).expect("should work");
+        let data_slice = buffer.data();
+        let sample_count = data_slice.len() / 4;
+        let channels = buffer.number_channels as usize;
+        // Process samples from this buffer
+        for i in 0..sample_count / channels {
+            let mut mixed_sample = 0.0f32;
+            // Mix all channels together (mono downmix)
+            for ch in 0..channels {
+                let idx = (i * channels + ch) * 4;
+                if idx + 3 < data_slice.len() {
+                    let sample_bytes = [
+                        data_slice[idx],
+                        data_slice[idx + 1],
+                        data_slice[idx + 2],
+                        data_slice[idx + 3],
+                    ];
+                    let sample = f32::from_le_bytes(sample_bytes);
+                    mixed_sample += sample / channels as f32;
+                }
+            }
+            all_samples.push(mixed_sample);
+        }
+    }
+    all_samples
 }
 
 fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
@@ -218,7 +250,7 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
 async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
     if let Ok(mut state) = RECORDING_STATE.lock() {
         let (tx, rx) = channel();
-        let stream = get_stream(tx).unwrap();
+        let stream = start_mac_os_stream(tx).unwrap();
         stream.start_capture().unwrap();
         state.stream = Some(stream);
         state.is_recording = true;
@@ -229,50 +261,17 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
         let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
             while let Ok(sample_buffer) = rx.recv() {
+                let all_samples = extract_audio_samples_from_buffer(&sample_buffer);
                 if let Ok(mut tokio_state) = RECORDING_STATE.lock() {
-                    let mut all_samples = Vec::new();
-                    let buffer_list = sample_buffer.get_audio_buffer_list().expect("should work");
-
-                    // Process all audio buffers and mix them properly
-                    for buffer_index in 0..buffer_list.num_buffers() {
-                        let buffer = buffer_list.get(buffer_index).expect("should work");
-                        let data_slice = buffer.data();
-                        let sample_count = data_slice.len() / 4;
-                        let channels = buffer.number_channels as usize;
-
-                        // Process samples from this buffer
-                        for i in 0..sample_count / channels {
-                            let mut mixed_sample = 0.0f32;
-                            // Mix all channels together (mono downmix)
-                            for ch in 0..channels {
-                                let idx = (i * channels + ch) * 4;
-                                if idx + 3 < data_slice.len() {
-                                    let sample_bytes = [
-                                        data_slice[idx],
-                                        data_slice[idx + 1],
-                                        data_slice[idx + 2],
-                                        data_slice[idx + 3],
-                                    ];
-                                    let sample = f32::from_le_bytes(sample_bytes);
-                                    mixed_sample += sample / channels as f32;
-                                }
-                            }
-                            all_samples.push(mixed_sample);
-                        }
-                    }
-                    // Add samples to the ring buffer with on-the-go resampling
                     tokio_state.audio_buffer.extend_resampled(&all_samples);
                     // Process with sliding window at regular intervals
                     if tokio_state.last_process_time.elapsed().as_secs_f32() >= WINDOW_STEP_SECONDS
                     {
-                        let window_samples =
-                            (TARGET_SAMPLE_RATE as f32 * WINDOW_SIZE_SECONDS) as usize;
                         // Check if we're falling behind in processing
                         let buffer_capacity =
                             (TARGET_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
                         let buffer_usage =
                             tokio_state.audio_buffer.len() as f32 / buffer_capacity as f32;
-
                         // If buffer is getting too full, we're effectively dropping audio by not keeping up
                         if buffer_usage > 0.95 {
                             let overflow_samples = tokio_state
@@ -287,43 +286,38 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                                 );
                             }
                         }
-                        // Only process if we have enough audio
-                        if tokio_state.audio_buffer.len() >= window_samples {
-                            // Take the last WINDOW_SIZE_SECONDS of audio
-                            let audio_window =
-                                tokio_state.audio_buffer.get_latest_samples(window_samples);
-                            println!("Processing window of {} samples", audio_window.len());
-                            if let Some((transcript, timing_seconds)) =
-                                transcribe_audio_chunk(&audio_window)
-                            {
-                                // Count translated samples (successful processing)
-                                tokio_state.translated_samples_count += audio_window.len() as u64;
-
-                                if !transcript.trim().is_empty() {
-                                    let transcript_event = TranscriptEvent {
-                                        text: transcript,
-                                        timing_ms: timing_seconds * 1000.0,
-                                        timing_display: format_timing(timing_seconds),
-                                    };
-                                    if let Err(e) =
-                                        app_handle_clone.emit("audio-transcript", &transcript_event)
-                                    {
-                                        eprintln!("Failed to emit transcript event: {:?}", e);
-                                    } else {
-                                        println!(
-                                            "Transcript emitted: {} (took {})",
-                                            transcript_event.text, transcript_event.timing_display
-                                        );
-                                    }
+                        let audio_window =
+                            tokio_state.audio_buffer.get_latest_samples(WINDOW_SAMPLES);
+                        println!("Processing window of {} samples", audio_window.len());
+                        if let Some((transcript, timing_seconds)) =
+                            transcribe_audio_chunk(&audio_window)
+                        {
+                            // Count translated samples (successful processing)
+                            tokio_state.translated_samples_count += audio_window.len() as u64;
+                            if !transcript.trim().is_empty() {
+                                let transcript_event = TranscriptEvent {
+                                    text: transcript,
+                                    timing_ms: timing_seconds * 1000.0,
+                                    timing_display: format_timing(timing_seconds),
+                                };
+                                if let Err(e) =
+                                    app_handle_clone.emit("audio-transcript", &transcript_event)
+                                {
+                                    eprintln!("Failed to emit transcript event: {:?}", e);
+                                } else {
+                                    println!(
+                                        "Transcript emitted: {} (took {})",
+                                        transcript_event.text, transcript_event.timing_display
+                                    );
                                 }
-                            } else {
-                                // Transcription failed - count these as dropped since they didn't make it through the model
-                                tokio_state.dropped_samples_count += audio_window.len() as u64;
-                                println!("WARN: Transcription failed, dropping {} samples (total dropped: {})", 
-                                       audio_window.len(), tokio_state.dropped_samples_count);
                             }
-                            tokio_state.last_process_time = time::Instant::now();
+                        } else {
+                            // Transcription failed - count these as dropped since they didn't make it through the model
+                            tokio_state.dropped_samples_count += audio_window.len() as u64;
+                            println!("WARN: Transcription failed, dropping {} samples (total dropped: {})", 
+                                       audio_window.len(), tokio_state.dropped_samples_count);
                         }
+                        tokio_state.last_process_time = time::Instant::now();
                     }
                 }
             }
