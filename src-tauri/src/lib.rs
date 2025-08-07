@@ -70,7 +70,7 @@ fn perform_transcription_update_ui(app_handle: &AppHandle) {
     let events = match last_event_opt {
         Some(last_event) => {
             if !last_event.is_final {
-                generate_new_sentance_events(text.clone(), timing_seconds, last_event)
+                generate_new_sentance_events(text.clone(), last_event.text.clone(), timing_seconds)
             } else {
                 vec![build_sentance_event(text.clone(), timing_seconds, false)]
             }
@@ -108,55 +108,125 @@ fn build_sentance_event(text: String, timing_seconds: f64, is_final: bool) -> Se
     }
 }
 
+// newer_transcript is a trancscipt generated from the latest audio chunk
+// older_transcript is a transcript generated from generally the same audio chunk but a bit older (value in the begging is older, )
+// while doing sliding widndows both transcript have the same middle part at least
 fn generate_new_sentance_events(
-    new_transcript: String,
+    newer_transcript: String,
+    older_transcript: String,
     timing_seconds: f64,
-    last_event: SentanceEvent,
 ) -> Vec<SentanceEvent> {
     let mut events: Vec<SentanceEvent> = Vec::new();
 
-    let new_text = new_transcript.trim().to_string();
-    let last_text = last_event.text.trim().to_string();
+    let new_text = newer_transcript.trim().to_string();
+    let old_text = older_transcript.trim().to_string();
 
-    if new_text == last_text {
+    if new_text == old_text {
         return events;
     }
 
-    fn last_sentence_end_exclusive(s: &str) -> Option<usize> {
-        s.char_indices()
-            .filter_map(|(i, ch)| match ch {
-                '.' | '!' | '?' | '…' => Some(i + ch.len_utf8()),
-                _ => None,
-            })
-            .last()
+    fn is_sentence_end(s: &str) -> bool {
+        s.chars()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .map(|c| matches!(c, '.' | '!' | '?' | '…'))
+            .unwrap_or(false)
     }
 
-    let prev_end = last_sentence_end_exclusive(&last_text);
-    let new_end = last_sentence_end_exclusive(&new_text);
+    // Basic behavior: emit updated text. Mark final if it appears to complete a sentence.
+    let is_final = is_sentence_end(&new_text);
+    events.push(build_sentance_event(new_text, timing_seconds, is_final));
+    events
+}
 
-    if let Some(new_end_idx) = new_end {
-        let is_new_sentence_completed = match prev_end {
-            Some(prev_idx) => new_end_idx > prev_idx,
-            None => new_end_idx > 0,
-        };
+// Exmple 1
+// older_transcript: "Hello, how are you doing?"
+// newer_transcript: "Hello, how are you doing? I'm doing well, thank you."
+// return: ("", "Hello, how are you doing?", "I'm doing well, thank you.")
+// Exmple 2
+// older_transcript: "What a nice day. Hello, how are you doing?"
+// newer_transcript: "What a nice day. Hello, how are you doing? I'm doing well, thank you."
+// return: ("What a nice day.", "Hello, how are you doing?", "I'm doing well, thank you.")
+// General case:
+// The first string returned is one thats is in the start of older_transcript and not in the start of newer_transcript
+// The second string returned is common part of the start of older_transcript and newer_transcript(usually located in the middle)
+// And the third string returned is one thats is in the end of newer_transcript and not in the end of older_transcript
+fn diff_start_common_part_diff_end(
+    newer_transcript: String,
+    older_transcript: String,
+) -> (String, String, String) {
+    let newer = newer_transcript.trim();
+    let older = older_transcript.trim();
 
-        if is_new_sentence_completed {
-            let completed_text = new_text[..new_end_idx].trim().to_string();
-            if completed_text != last_text {
-                events.push(build_sentance_event(completed_text, timing_seconds, true));
+    // Helper: find last sentence boundary start index in `older` (position of the first char of the last sentence)
+    fn last_sentence_start_index(s: &str) -> Option<usize> {
+        // Find last punctuation among . ! ? … and then skip following spaces
+        let mut last_punct_byte_idx: Option<usize> = None;
+        for (i, ch) in s.char_indices() {
+            if matches!(ch, '.' | '!' | '?' | '…') {
+                last_punct_byte_idx = Some(i);
             }
-
-            let remainder = new_text[new_end_idx..].trim().to_string();
-            if !remainder.is_empty() {
-                events.push(build_sentance_event(remainder, timing_seconds, false));
+        }
+        let punct_idx = last_punct_byte_idx?;
+        // Advance to first non-space after punctuation
+        let mut idx = punct_idx
+            + s[punct_idx..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
+        for (off, ch) in s[idx..].char_indices() {
+            if !ch.is_whitespace() {
+                idx += off;
+                return Some(idx);
             }
+        }
+        // No non-space after punctuation -> no last sentence start
+        None
+    }
 
-            return events;
+    // Preferred split: use the last sentence in `older` as the common part if the newer text contains it
+    if let Some(start_idx) = last_sentence_start_index(older) {
+        if start_idx < older.len() {
+            let common_candidate = older[start_idx..].trim_start();
+            if !common_candidate.is_empty() {
+                if let Some(pos) = newer.find(common_candidate) {
+                    let start_diff = older[..start_idx].trim_end().to_string();
+                    let common = common_candidate.to_string();
+                    let mut end_diff = String::new();
+                    let after = pos + common_candidate.len();
+                    if after <= newer.len() {
+                        end_diff = newer[after..].trim_start().to_string();
+                    }
+                    return (start_diff, common, end_diff);
+                }
+            }
         }
     }
 
-    events.push(build_sentance_event(new_text, timing_seconds, false));
-    events
+    // Fallback: use the longest suffix of `older` that is a prefix of `newer`
+    let older_bytes = older.as_bytes();
+    let newer_bytes = newer.as_bytes();
+    let max_k = older_bytes.len().min(newer_bytes.len());
+    let mut overlap_len = 0usize;
+    for k in (1..=max_k).rev() {
+        if &older_bytes[older_bytes.len() - k..] == &newer_bytes[..k] {
+            overlap_len = k;
+            break;
+        }
+    }
+
+    if overlap_len == 0 {
+        // No overlap
+        return (older.to_string(), String::new(), newer.to_string());
+    }
+
+    // Convert byte indexes to string slices
+    let start_idx = older.len() - overlap_len;
+    let start_diff = older[..start_idx].trim_end().to_string();
+    let common = older[start_idx..].to_string();
+    let end_diff = newer[overlap_len..].trim_start().to_string();
+    (start_diff, common, end_diff)
 }
 
 #[derive(Serialize, Clone)]
