@@ -108,11 +108,9 @@ static MODEL: OnceLock<Mutex<Option<WhisperContext>>> = OnceLock::new();
 fn resample_audio(input: &[f32]) -> Vec<f32> {
     let output_len = (input.len() as f32 * RESAMPLE_RATIO) as usize;
     let mut output = Vec::with_capacity(output_len);
-
     for i in 0..output_len {
         let src_idx = i as f32 / RESAMPLE_RATIO;
         let idx = src_idx as usize;
-
         if idx + 1 < input.len() {
             // Linear interpolation between samples
             let frac = src_idx - idx as f32;
@@ -122,7 +120,6 @@ fn resample_audio(input: &[f32]) -> Vec<f32> {
             output.push(input[idx]);
         }
     }
-
     output
 }
 
@@ -164,10 +161,11 @@ fn init() {
     };
     // Enable GPU if available for better performance
     context_param.use_gpu = true;
-
+    let gpu_enabled = context_param.use_gpu;
     let model_path = "/Users/sammers/Git/my/tauri-whisper/ggml-large-v3.bin"; // Path to your Whisper model file
     let ctx =
         WhisperContext::new_with_params(&model_path, context_param).expect("failed to load model");
+    println!("✅ Whisper model loaded with GPU enabled: {}", gpu_enabled);
     MODEL.get_or_init(|| Mutex::new(Some(ctx)));
 }
 
@@ -228,7 +226,6 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
         state.audio_buffer.clear();
         state.dropped_samples_count = 0; // Reset counter on new recording
         state.translated_samples_count = 0; // Reset translated samples counter
-                                            // Clone the app_handle to move into the spawned task
         let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
             while let Ok(sample_buffer) = rx.recv() {
@@ -246,7 +243,6 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                         // Process samples from this buffer
                         for i in 0..sample_count / channels {
                             let mut mixed_sample = 0.0f32;
-
                             // Mix all channels together (mono downmix)
                             for ch in 0..channels {
                                 let idx = (i * channels + ch) * 4;
@@ -261,7 +257,6 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                                     mixed_sample += sample / channels as f32;
                                 }
                             }
-
                             all_samples.push(mixed_sample);
                         }
                     }
