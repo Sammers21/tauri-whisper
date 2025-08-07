@@ -4,6 +4,7 @@
 
 use core_foundation::error::CFError;
 use core_media_rs::cm_sample_buffer::CMSampleBuffer;
+use ringbuf::{HeapRb, Rb};
 
 use screencapturekit::{
     shareable_content::SCShareableContent,
@@ -40,6 +41,50 @@ fn format_timing(seconds: f64) -> String {
 const SOURCE_SAMPLE_RATE: u32 = 48000;
 const TARGET_SAMPLE_RATE: u32 = 16000;
 const RESAMPLE_RATIO: f32 = TARGET_SAMPLE_RATE as f32 / SOURCE_SAMPLE_RATE as f32;
+
+// Audio ring buffer wrapper for convenience
+struct AudioRingBuffer {
+    buffer: HeapRb<f32>,
+}
+
+impl AudioRingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            buffer: HeapRb::new(capacity),
+        }
+    }
+
+    fn extend_resampled(&mut self, samples: &[f32]) {
+        // Resample on-the-go while adding to ring buffer
+        let resampled = resample_audio(samples);
+
+        for sample in resampled {
+            // Use push_overwrite which automatically handles buffer overflow
+            // We don't track drops here - drops should be tracked when samples
+            // don't make it to the model, not during resampling
+            self.buffer.push_overwrite(sample);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    fn get_latest_samples(&self, count: usize) -> Vec<f32> {
+        if count > self.buffer.len() {
+            return Vec::new();
+        }
+
+        let total_len = self.buffer.len();
+        let start_idx = total_len.saturating_sub(count);
+
+        self.buffer.iter().skip(start_idx).copied().collect()
+    }
+}
 
 struct AudioStreamOutput {
     sender: Sender<CMSampleBuffer>,
@@ -83,7 +128,7 @@ fn resample_audio(input: &[f32]) -> Vec<f32> {
 
 // Audio recording control state
 struct AudioRecordingState {
-    audio_buffer: Vec<f32>, // Rolling buffer of audio samples
+    audio_buffer: AudioRingBuffer, // Ring buffer for efficient audio storage (already resampled to 16kHz)
     last_process_time: time::Instant,
     dropped_samples_count: u64, // Track dropped samples due to buffer overflow
     translated_samples_count: u64, // Track samples that were successfully processed
@@ -98,8 +143,11 @@ const WINDOW_STEP_SECONDS: f32 = 10.0; // Process every 0.5 seconds
 const MAX_BUFFER_SECONDS: f32 = 20.0; // Keep maximum 10 seconds of audi0
 
 static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::new(|| {
+    // Calculate ring buffer capacity for resampled audio (16kHz)
+    let buffer_capacity = (TARGET_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
+
     Arc::new(Mutex::new(AudioRecordingState {
-        audio_buffer: Vec::new(),
+        audio_buffer: AudioRingBuffer::new(buffer_capacity),
         last_process_time: time::Instant::now(),
         dropped_samples_count: 0,
         translated_samples_count: 0,
@@ -134,8 +182,7 @@ fn get_stream(tx: Sender<CMSampleBuffer>) -> Result<SCStream, CFError> {
 
 fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let start_time = time::Instant::now();
-    // Resample audio from 48kHz to 16kHz
-    let resampled_audio = resample_audio(audio_data);
+    // Audio data is already resampled to 16kHz in the ring buffer
     let model_guard = MODEL.get()?.lock().ok()?;
     let ctx = model_guard.as_ref()?;
     // Create a state
@@ -151,7 +198,7 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     // Optimize for speed
     params.set_single_segment(true);
     params.set_suppress_blank(false);
-    if state.full(params, &resampled_audio).is_err() {
+    if state.full(params, audio_data).is_err() {
         return None;
     }
     // Get the transcript
@@ -220,35 +267,42 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                             all_samples.push(mixed_sample);
                         }
                     }
-                    // Add samples to the rolling buffer
-                    tokio_state.audio_buffer.extend(all_samples);
-                    // Keep buffer size under control
-                    let max_samples = (SOURCE_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
-                    if tokio_state.audio_buffer.len() > max_samples {
-                        let excess = tokio_state.audio_buffer.len() - max_samples;
-                        tokio_state.dropped_samples_count += excess as u64;
-                        println!(
-                            "ERROR: Dropping {} samples (total dropped: {})",
-                            excess, tokio_state.dropped_samples_count
-                        );
-                        tokio_state.audio_buffer.drain(0..excess);
-                    }
+                    // Add samples to the ring buffer with on-the-go resampling
+                    tokio_state.audio_buffer.extend_resampled(&all_samples);
                     // Process with sliding window at regular intervals
                     if tokio_state.last_process_time.elapsed().as_secs_f32() >= WINDOW_STEP_SECONDS
                     {
                         let window_samples =
-                            (SOURCE_SAMPLE_RATE as f32 * WINDOW_SIZE_SECONDS) as usize;
+                            (TARGET_SAMPLE_RATE as f32 * WINDOW_SIZE_SECONDS) as usize;
+                        // Check if we're falling behind in processing
+                        let buffer_capacity =
+                            (TARGET_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
+                        let buffer_usage =
+                            tokio_state.audio_buffer.len() as f32 / buffer_capacity as f32;
+
+                        // If buffer is getting too full, we're effectively dropping audio by not keeping up
+                        if buffer_usage > 0.95 {
+                            let overflow_samples = tokio_state
+                                .audio_buffer
+                                .len()
+                                .saturating_sub((buffer_capacity as f32 * 0.8) as usize);
+                            if overflow_samples > 0 {
+                                tokio_state.dropped_samples_count += overflow_samples as u64;
+                                println!(
+                                    "WARN: Processing falling behind, buffer {}% full - effectively dropping {} samples (total dropped: {})",
+                                    (buffer_usage * 100.0) as u32, overflow_samples, tokio_state.dropped_samples_count
+                                );
+                            }
+                        }
+
                         // Only process if we have enough audio
                         if tokio_state.audio_buffer.len() >= window_samples {
                             // Take the last WINDOW_SIZE_SECONDS of audio
-                            let start_idx = tokio_state
-                                .audio_buffer
-                                .len()
-                                .saturating_sub(window_samples);
-                            let audio_window = &tokio_state.audio_buffer[start_idx..];
+                            let audio_window =
+                                tokio_state.audio_buffer.get_latest_samples(window_samples);
                             println!("Processing window of {} samples", audio_window.len());
                             if let Some((transcript, timing_seconds)) =
-                                transcribe_audio_chunk(audio_window)
+                                transcribe_audio_chunk(&audio_window)
                             {
                                 // Count translated samples (successful processing)
                                 tokio_state.translated_samples_count += audio_window.len() as u64;
@@ -270,6 +324,11 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                                         );
                                     }
                                 }
+                            } else {
+                                // Transcription failed - count these as dropped since they didn't make it through the model
+                                tokio_state.dropped_samples_count += audio_window.len() as u64;
+                                println!("WARN: Transcription failed, dropping {} samples (total dropped: {})", 
+                                       audio_window.len(), tokio_state.dropped_samples_count);
                             }
                             tokio_state.last_process_time = time::Instant::now();
                         }
