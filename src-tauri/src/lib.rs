@@ -16,18 +16,156 @@ use screencapturekit::{
 use serde::Serialize;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::{
-    collections::HashSet,
     sync::mpsc::{channel, Sender},
     time,
 };
 use tauri::{AppHandle, Emitter};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
-#[derive(Serialize)]
-struct TranscriptEvent {
+// Constants for audio processing
+const SOURCE_SAMPLE_RATE: u32 = 48000;
+const TARGET_SAMPLE_RATE: u32 = 16000;
+const SLIDING_WINDOW_SIZE: f32 = 15.0;
+const RESAMPLE_RATIO: f32 = TARGET_SAMPLE_RATE as f32 / SOURCE_SAMPLE_RATE as f32;
+const WINDOW_SAMPLES: usize = (SLIDING_WINDOW_SIZE * TARGET_SAMPLE_RATE as f32) as usize;
+
+// Whisper model
+static MODEL: OnceLock<Mutex<Option<WhisperContext>>> = OnceLock::new();
+
+// Audio recording state
+static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::new(|| {
+    // Calculate ring buffer capacity for resampled audio (16kHz)
+    let buffer_capacity = (TARGET_SAMPLE_RATE as f32 * SLIDING_WINDOW_SIZE) as usize;
+    Arc::new(Mutex::new(AudioRecordingState {
+        audio_buffer: AudioRingBuffer::new(buffer_capacity),
+        dropped_samples_count: 0,
+        translated_samples_count: 0,
+        last_event: None,
+        is_recording: false,
+        stream: None,
+    }))
+});
+
+fn perform_transcription_update_ui(app_handle: &AppHandle) {
+    let (audio_window, last_event_opt) = {
+        let mut window = Vec::with_capacity(WINDOW_SAMPLES);
+        let mut last_event: Option<SentanceEvent> = None;
+        if let Ok(state) = RECORDING_STATE.lock() {
+            window = state.audio_buffer.get_latest_samples(WINDOW_SAMPLES);
+            if let Some(t) = &state.last_event {
+                last_event = Some(t.clone());
+            }
+        }
+        (window, last_event)
+    };
+    if audio_window.is_empty() {
+        return;
+    }
+    let Some((text, timing_seconds)) = transcribe_audio_chunk(&audio_window) else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    let events = match last_event_opt {
+        Some(last_event) => {
+            if !last_event.is_final {
+                generate_new_sentance_events(text.clone(), timing_seconds, last_event)
+            } else {
+                vec![build_sentance_event(text.clone(), timing_seconds, false)]
+            }
+        }
+        None => vec![build_sentance_event(text.clone(), timing_seconds, false)],
+    };
+    if events.is_empty() {
+        return;
+    }
+    for event in &events {
+        if let Err(e) = app_handle.emit("sentance", event) {
+            eprintln!("Failed to emit sentance event: {:?}", e);
+        }
+    }
+    if let Ok(mut state) = RECORDING_STATE.lock() {
+        if let Some(last) = events.last() {
+            state.last_event = Some(last.clone());
+        }
+    }
+}
+
+fn process_sample_buffer(sample_buffer: &CMSampleBuffer) {
+    let all_samples = extract_audio_samples_from_buffer(sample_buffer);
+    if let Ok(mut state) = RECORDING_STATE.lock() {
+        state.audio_buffer.extend_resampled(&all_samples);
+    }
+}
+
+fn build_sentance_event(text: String, timing_seconds: f64, is_final: bool) -> SentanceEvent {
+    SentanceEvent {
+        text,
+        timing_ms: timing_seconds * 1000.0,
+        timing_display: format_timing(timing_seconds),
+        is_final,
+    }
+}
+
+fn generate_new_sentance_events(
+    new_transcript: String,
+    timing_seconds: f64,
+    last_event: SentanceEvent,
+) -> Vec<SentanceEvent> {
+    let mut events: Vec<SentanceEvent> = Vec::new();
+
+    let new_text = new_transcript.trim().to_string();
+    let last_text = last_event.text.trim().to_string();
+
+    if new_text == last_text {
+        return events;
+    }
+
+    fn last_sentence_end_exclusive(s: &str) -> Option<usize> {
+        s.char_indices()
+            .filter_map(|(i, ch)| match ch {
+                '.' | '!' | '?' | '…' => Some(i + ch.len_utf8()),
+                _ => None,
+            })
+            .last()
+    }
+
+    let prev_end = last_sentence_end_exclusive(&last_text);
+    let new_end = last_sentence_end_exclusive(&new_text);
+
+    if let Some(new_end_idx) = new_end {
+        let is_new_sentence_completed = match prev_end {
+            Some(prev_idx) => new_end_idx > prev_idx,
+            None => new_end_idx > 0,
+        };
+
+        if is_new_sentence_completed {
+            let completed_text = new_text[..new_end_idx].trim().to_string();
+            if completed_text != last_text {
+                events.push(build_sentance_event(completed_text, timing_seconds, true));
+            }
+
+            let remainder = new_text[new_end_idx..].trim().to_string();
+            if !remainder.is_empty() {
+                events.push(build_sentance_event(remainder, timing_seconds, false));
+            }
+
+            return events;
+        }
+    }
+
+    events.push(build_sentance_event(new_text, timing_seconds, false));
+    events
+}
+
+#[derive(Serialize, Clone)]
+struct SentanceEvent {
     text: String,
     timing_ms: f64,
     timing_display: String,
+    // if the sentance is final or not
+    is_final: bool,
 }
 
 fn format_timing(seconds: f64) -> String {
@@ -37,12 +175,6 @@ fn format_timing(seconds: f64) -> String {
         format!("{:.0}ms", seconds * 1000.0)
     }
 }
-
-// Audio resampling constants
-const SOURCE_SAMPLE_RATE: u32 = 48000;
-const TARGET_SAMPLE_RATE: u32 = 16000;
-const RESAMPLE_RATIO: f32 = TARGET_SAMPLE_RATE as f32 / SOURCE_SAMPLE_RATE as f32;
-const WINDOW_SAMPLES: usize = (WINDOW_SIZE_SECONDS * TARGET_SAMPLE_RATE as f32) as usize;
 
 // Audio ring buffer wrapper for convenience
 struct AudioRingBuffer {
@@ -103,8 +235,6 @@ impl SCStreamOutputTrait for AudioStreamOutput {
     }
 }
 
-static MODEL: OnceLock<Mutex<Option<WhisperContext>>> = OnceLock::new();
-
 // Simple linear interpolation resampling from 48kHz to 16kHz
 fn resample_audio(input: &[f32]) -> Vec<f32> {
     let output_len = (input.len() as f32 * RESAMPLE_RATIO) as usize;
@@ -127,39 +257,17 @@ fn resample_audio(input: &[f32]) -> Vec<f32> {
 // Audio recording control state
 struct AudioRecordingState {
     audio_buffer: AudioRingBuffer, // Ring buffer for efficient audio storage (already resampled to 16kHz)
-    last_process_time: time::Instant,
-    dropped_samples_count: u64, // Track dropped samples due to buffer overflow
+    dropped_samples_count: u64,    // Track dropped samples due to buffer overflow
     translated_samples_count: u64, // Track samples that were successfully processed
-    last_result_of_transcription: String,
+    last_event: Option<SentanceEvent>,
     is_recording: bool,
     stream: Option<SCStream>,
 }
 
-// Constants for sliding window
-const WINDOW_SIZE_SECONDS: f32 = 15.0;
-const WINDOW_STEP_SECONDS: f32 = 1.0;
-const MAX_BUFFER_SECONDS: f32 = 20.0;
-
-static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::new(|| {
-    // Calculate ring buffer capacity for resampled audio (16kHz)
-    let buffer_capacity = (TARGET_SAMPLE_RATE as f32 * MAX_BUFFER_SECONDS) as usize;
-
-    Arc::new(Mutex::new(AudioRecordingState {
-        audio_buffer: AudioRingBuffer::new(buffer_capacity),
-        last_process_time: time::Instant::now(),
-        dropped_samples_count: 0,
-        translated_samples_count: 0,
-        last_result_of_transcription: String::new(),
-        is_recording: false,
-        stream: None,
-    }))
-});
-
 fn init() {
     let mut context_param = WhisperContextParameters::default();
-    context_param.dtw_parameters.mode = whisper_rs::DtwMode::ModelPreset {
-        model_preset: whisper_rs::DtwModelPreset::LargeV3Turbo,
-    };
+    // Disable DTW token-level timestamps for streaming to avoid median filter assertions on small chunks
+    context_param.dtw_parameters.mode = whisper_rs::DtwMode::None;
     // Enable GPU if available for better performance
     context_param.use_gpu = true;
     let gpu_enabled = context_param.use_gpu;
@@ -211,41 +319,11 @@ fn extract_audio_samples_from_buffer(sample_buffer: &CMSampleBuffer) -> Vec<f32>
     all_samples
 }
 
-fn remove_common_words(current_transcript: &str, last_transcript: &str) -> (String, bool) {
-    // If there's no previous transcript, return the current one as-is
-    if last_transcript.trim().is_empty() {
-        return (current_transcript.to_string(), false);
-    }
-
-    // Split both transcripts into words (lowercase for comparison)
-    let current_words: Vec<&str> = current_transcript.split_whitespace().collect();
-    let last_transcript_lower = last_transcript.to_lowercase();
-    let last_words: HashSet<&str> = last_transcript_lower.split_whitespace().collect();
-
-    // Filter out words that appeared in the last transcript
-    let mut filtered_words = Vec::new();
-    let mut words_removed = false;
-
-    for word in current_words {
-        let word_lower = word.to_lowercase();
-        if !last_words.contains(word_lower.as_str()) {
-            filtered_words.push(word);
-        } else {
-            words_removed = true;
-        }
-    }
-
-    // Join the filtered words back into a string
-    let result = filtered_words.join(" ");
-
-    // If we removed all words, return the original to avoid empty results
-    if result.trim().is_empty() && !current_transcript.trim().is_empty() {
-        return (current_transcript.to_string(), false);
-    }
-
-    (result, words_removed)
-}
-
+/// Transcribe a 16 kHz mono PCM chunk using the global Whisper context.
+///
+/// - Expects `audio_data` at 16_000 Hz (mono)
+/// - Returns `Some((transcript, elapsed_seconds))` on success, `None` on failure
+/// - Synchronous; run off the main/UI thread
 fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let start_time = time::Instant::now();
     // Audio data is already resampled to 16kHz in the ring buffer
@@ -261,9 +339,11 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
-    // Optimize for speed
+    // Optimize for speed and avoid DTW on small streaming windows
     params.set_single_segment(true);
     params.set_suppress_blank(false);
+    params.set_token_timestamps(false);
+    println!("Transcribing audio chunk of length {}", audio_data.len());
     if state.full(params, audio_data).is_err() {
         return None;
     }
@@ -290,58 +370,18 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
         stream.start_capture().unwrap();
         state.stream = Some(stream);
         state.is_recording = true;
-        state.last_process_time = time::Instant::now();
         state.audio_buffer.clear();
         state.dropped_samples_count = 0; // Reset counter on new recording
         state.translated_samples_count = 0; // Reset translated samples counter
         let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
             while let Ok(sample_buffer) = rx.recv() {
-                let all_samples = extract_audio_samples_from_buffer(&sample_buffer);
-                if let Ok(mut tokio_state) = RECORDING_STATE.lock() {
-                    tokio_state.audio_buffer.extend_resampled(&all_samples);
-                    // Process with sliding window at regular intervals
-                    if tokio_state.last_process_time.elapsed().as_secs_f32() >= WINDOW_STEP_SECONDS
-                    {
-                        let audio_window =
-                            tokio_state.audio_buffer.get_latest_samples(WINDOW_SAMPLES);
-                        println!("Processing window of {} samples", audio_window.len());
-                        if let Some((transcript, timing_seconds)) =
-                            transcribe_audio_chunk(&audio_window)
-                        {
-                            // Count translated samples (successful processing)
-                            tokio_state.translated_samples_count += audio_window.len() as u64;
-                            let (to_send, _common_words_removed) = remove_common_words(
-                                &transcript,
-                                &tokio_state.last_result_of_transcription,
-                            );
-                            tokio_state.last_result_of_transcription = transcript.clone();
-                            if !transcript.trim().is_empty() {
-                                let transcript_event = TranscriptEvent {
-                                    text: to_send,
-                                    timing_ms: timing_seconds * 1000.0,
-                                    timing_display: format_timing(timing_seconds),
-                                };
-                                if let Err(e) =
-                                    app_handle_clone.emit("audio-transcript", &transcript_event)
-                                {
-                                    eprintln!("Failed to emit transcript event: {:?}", e);
-                                } else {
-                                    println!(
-                                        "Transcript emitted: {} (took {})",
-                                        transcript_event.text, transcript_event.timing_display
-                                    );
-                                }
-                            }
-                        } else {
-                            // Transcription failed - count these as dropped since they didn't make it through the model
-                            tokio_state.dropped_samples_count += audio_window.len() as u64;
-                            println!("WARN: Transcription failed, dropping {} samples (total dropped: {})", 
-                                       audio_window.len(), tokio_state.dropped_samples_count);
-                        }
-                        tokio_state.last_process_time = time::Instant::now();
-                    }
-                }
+                process_sample_buffer(&sample_buffer);
+            }
+        });
+        tokio::spawn(async move {
+            loop {
+                perform_transcription_update_ui(&app_handle_clone);
             }
         });
     } else {
@@ -383,15 +423,6 @@ async fn get_translated_samples_count() -> Result<u64, String> {
     }
 }
 
-#[tauri::command]
-async fn list_audio_devices() -> Result<String, String> {
-    // For macOS with ScreenCaptureKit, system audio capture is built-in
-    Ok(
-        "✅ System audio capture available via ScreenCaptureKit\nNo additional setup required."
-            .to_string(),
-    )
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init();
@@ -402,7 +433,6 @@ pub fn run() {
             stop_recording,
             get_dropped_samples_count,
             get_translated_samples_count,
-            list_audio_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

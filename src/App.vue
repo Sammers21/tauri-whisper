@@ -9,7 +9,6 @@ const transcriptEntries = ref<
 >([]);
 const statusMessage = ref("Ready to start recording");
 const isLoading = ref(false);
-const deviceList = ref("");
 const lastTranscriptionTime = ref("");
 const droppedSamplesCount = ref(0);
 const translatedSamplesCount = ref(0);
@@ -18,28 +17,38 @@ let unlistenTranscript: UnlistenFn | null = null;
 let droppedSamplesInterval: number | null = null;
 
 onMounted(async () => {
-  // Listen for real-time transcript events
-  unlistenTranscript = await listen("audio-transcript", (event) => {
+  // Listen for real-time sentance events
+  unlistenTranscript = await listen("sentance", (event) => {
     const payload = event.payload as {
       text: string;
       timing_ms: number;
       timing_display: string;
+      is_final: boolean;
     };
-    if (payload && payload.text && payload.text.trim()) {
+    const text = payload?.text?.trim();
+    if (!text) return;
+
+    lastTranscriptionTime.value = payload.timing_display;
+    changeLastTo({
+      text: text,
+      timing: payload.timing_display,
+      timestamp: new Date(),
+    });
+    if (payload.is_final) {
       transcriptEntries.value.push({
-        text: payload.text,
-        timing: payload.timing_display,
+        text: "",
+        timing: "",
         timestamp: new Date(),
       });
-      lastTranscriptionTime.value = payload.timing_display;
-      // Auto-scroll to bottom
-      setTimeout(() => {
-        const transcriptList = document.getElementById("transcript-list");
-        if (transcriptList) {
-          transcriptList.scrollTop = transcriptList.scrollHeight;
-        }
-      }, 10);
     }
+
+    // Auto-scroll to bottom
+    setTimeout(() => {
+      const transcriptList = document.getElementById("transcript-list");
+      if (transcriptList) {
+        transcriptList.scrollTop = transcriptList.scrollHeight;
+      }
+    }, 10);
   });
 });
 
@@ -137,33 +146,16 @@ async function updateSamplesCounts() {
   ]);
 }
 
-async function listAudioDevices() {
-  try {
-    const devices = await invoke("list_audio_devices");
-    deviceList.value = devices as string;
-  } catch (error) {
-    deviceList.value = `Error: ${error}`;
+function changeLastTo(entry: {
+  text: string;
+  timing: string;
+  timestamp: Date;
+}) {
+  if (transcriptEntries.value.length > 0) {
+    transcriptEntries.value[transcriptEntries.value.length - 1] = entry;
+  } else {
+    transcriptEntries.value.push(entry);
   }
-}
-
-function getAudioSetupStatus() {
-  if (!deviceList.value) {
-    return "Click 'List Audio Devices' to check setup";
-  }
-
-  if (deviceList.value.includes("✅ System audio capture available")) {
-    return "✅ System audio capture ready - no setup required";
-  }
-
-  if (
-    deviceList.value.includes("BlackHole") ||
-    deviceList.value.includes("loopback") ||
-    deviceList.value.includes("monitor")
-  ) {
-    return "✅ System audio device detected";
-  }
-
-  return "⚠️ Using fallback device - may capture microphone instead";
 }
 </script>
 
@@ -259,72 +251,6 @@ function getAudioSetupStatus() {
       <div v-else class="transcript-placeholder">
         Your speech will appear here in real-time...
       </div>
-    </div>
-
-    <!-- Audio Devices Section -->
-    <div class="devices-section">
-      <h3>Audio Setup</h3>
-      <p><strong>Current Status:</strong> {{ getAudioSetupStatus() }}</p>
-      <button @click="listAudioDevices" class="devices-button">
-        List Audio Devices
-      </button>
-      <pre v-if="deviceList" class="device-list">{{ deviceList }}</pre>
-
-      <div
-        class="setup-warning"
-        v-if="
-          deviceList &&
-          !deviceList.includes('✅ System audio capture available') &&
-          !deviceList.includes('BlackHole') &&
-          !deviceList.includes('loopback') &&
-          !deviceList.includes('monitor')
-        "
-      >
-        <h4>⚠️ System Audio Capture Not Available</h4>
-        <p>
-          The app is using a fallback device which may capture microphone audio
-          instead of system audio.
-        </p>
-        <p><strong>To improve system audio capture:</strong></p>
-        <ul>
-          <li>
-            <strong>macOS:</strong> App should automatically use
-            ScreenCaptureKit (requires permission)
-          </li>
-          <li>
-            <strong>Windows:</strong> App should automatically use WASAPI
-            loopback
-          </li>
-          <li><strong>Linux:</strong> Uses PulseAudio monitor sources</li>
-          <li>
-            <strong>Alternative:</strong> Install a virtual audio device like
-            BlackHole (macOS)
-          </li>
-        </ul>
-      </div>
-    </div>
-
-    <!-- Info Section -->
-    <div class="info-section">
-      <p><strong>Instructions:</strong></p>
-      <ul>
-        <li>
-          <strong>System Audio:</strong> Click "Start Recording" to capture all
-          computer audio (like OBS)
-        </li>
-        <li>
-          <strong>Permission:</strong> May prompt for screen recording
-          permission on macOS
-        </li>
-        <li>
-          <strong>Testing:</strong> Play music, videos, or any audio while
-          recording
-        </li>
-        <li>Click "List Audio Devices" to see available capture methods</li>
-        <li>Transcription appears at sentence boundaries for natural flow</li>
-        <li>Check the browser console for detailed audio capture logs</li>
-        <li>Click "Stop Recording" when finished</li>
-      </ul>
     </div>
   </main>
 </template>
