@@ -158,12 +158,12 @@ static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::ne
 fn init() {
     let mut context_param = WhisperContextParameters::default();
     context_param.dtw_parameters.mode = whisper_rs::DtwMode::ModelPreset {
-        model_preset: whisper_rs::DtwModelPreset::LargeV3,
+        model_preset: whisper_rs::DtwModelPreset::LargeV3Turbo,
     };
     // Enable GPU if available for better performance
     context_param.use_gpu = true;
     let gpu_enabled = context_param.use_gpu;
-    let model_path = "/Users/sammers/Git/my/tauri-whisper/ggml-large-v3.bin"; // Path to your Whisper model file
+    let model_path = "/Users/sammers/Git/my/tauri-whisper/ggml-large-v3-turbo.bin"; // Path to your Whisper model file
     let ctx =
         WhisperContext::new_with_params(&model_path, context_param).expect("failed to load model");
     println!("✅ Whisper model loaded with GPU enabled: {}", gpu_enabled);
@@ -256,7 +256,7 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     // Create params optimized for real-time transcription
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
     params.set_translate(false);
-    params.set_language(Some("ru"));
+    params.set_language(Some("en"));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
