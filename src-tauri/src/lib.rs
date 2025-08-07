@@ -189,7 +189,7 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let mut state = ctx.create_state().ok()?;
     // Create params optimized for real-time transcription
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-    params.set_translate(false); // Don't translate, just transcribe
+    params.set_translate(true);
     params.set_language(Some("en"));
     params.set_print_special(false);
     params.set_print_progress(false);
@@ -210,11 +210,9 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
             result.push(' ');
         }
     }
-
     let elapsed_time = start_time.elapsed().as_secs_f64();
     let timing_display = format_timing(elapsed_time);
     println!("Transcription took {}", timing_display);
-
     Some((result.trim().to_string(), elapsed_time))
 }
 
@@ -294,7 +292,6 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
                                 );
                             }
                         }
-
                         // Only process if we have enough audio
                         if tokio_state.audio_buffer.len() >= window_samples {
                             // Take the last WINDOW_SIZE_SECONDS of audio
