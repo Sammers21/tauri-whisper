@@ -31,6 +31,7 @@ ringbuf = "0.3"
 screencapturekit = "0.3.6"
 core-foundation = "0.10.1"
 core-media-rs = { version = "0.3" }
+regex = "1"
 
 # System audio capture dependencies
 [target.'cfg(target_os = "macos")'.dependencies]

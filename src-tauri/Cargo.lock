@@ -4306,6 +4306,7 @@ dependencies = [
  "cpal",
  "hound",
  "pulse",
+ "regex",
  "ringbuf",
  "ruhear",
  "screencapturekit 0.3.6",

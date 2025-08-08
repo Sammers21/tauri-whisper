@@ -4,6 +4,7 @@
 
 use core_foundation::error::CFError;
 use core_media_rs::cm_sample_buffer::CMSampleBuffer;
+use regex::Regex;
 use ringbuf::{HeapRb, Rb};
 
 use screencapturekit::{
@@ -25,7 +26,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 // Constants for audio processing
 const SOURCE_SAMPLE_RATE: u32 = 48000;
 const TARGET_SAMPLE_RATE: u32 = 16000;
-const SLIDING_WINDOW_SIZE: f32 = 15.0;
+const SLIDING_WINDOW_SIZE: f32 = 60.0;
 const RESAMPLE_RATIO: f32 = TARGET_SAMPLE_RATE as f32 / SOURCE_SAMPLE_RATE as f32;
 const WINDOW_SAMPLES: usize = (SLIDING_WINDOW_SIZE * TARGET_SAMPLE_RATE as f32) as usize;
 
@@ -40,23 +41,21 @@ static RECORDING_STATE: LazyLock<Arc<Mutex<AudioRecordingState>>> = LazyLock::ne
         audio_buffer: AudioRingBuffer::new(buffer_capacity),
         dropped_samples_count: 0,
         translated_samples_count: 0,
-        last_event: None,
+        all_sentances: Vec::new(),
         is_recording: false,
         stream: None,
     }))
 });
 
 fn perform_transcription_update_ui(app_handle: &AppHandle) {
-    let (audio_window, last_event_opt) = {
+    let (audio_window, mut current_sentances) = {
         let mut window = Vec::with_capacity(WINDOW_SAMPLES);
-        let mut last_event: Option<SentanceEvent> = None;
+        let mut current_sentances: Vec<String> = Vec::new();
         if let Ok(state) = RECORDING_STATE.lock() {
             window = state.audio_buffer.get_latest_samples(WINDOW_SAMPLES);
-            if let Some(t) = &state.last_event {
-                last_event = Some(t.clone());
-            }
+            current_sentances = state.all_sentances.clone();
         }
-        (window, last_event)
+        (window, current_sentances)
     };
     if audio_window.is_empty() {
         return;
@@ -67,28 +66,18 @@ fn perform_transcription_update_ui(app_handle: &AppHandle) {
     if text.trim().is_empty() {
         return;
     }
-    let events = match last_event_opt {
-        Some(last_event) => {
-            if !last_event.is_final {
-                generate_new_sentance_events(text.clone(), last_event.text.clone(), timing_seconds)
-            } else {
-                vec![build_sentance_event(text.clone(), timing_seconds, false)]
-            }
-        }
-        None => vec![build_sentance_event(text.clone(), timing_seconds, false)],
-    };
+    let events = generate_new_sentance_events(text.clone(), &mut current_sentances, timing_seconds);
     if events.is_empty() {
         return;
     }
     for event in &events {
+        println!("Emitting sentance event: {:?}", event);
         if let Err(e) = app_handle.emit("sentance", event) {
             eprintln!("Failed to emit sentance event: {:?}", e);
         }
     }
     if let Ok(mut state) = RECORDING_STATE.lock() {
-        if let Some(last) = events.last() {
-            state.last_event = Some(last.clone());
-        }
+        state.all_sentances = current_sentances;
     }
 }
 
@@ -108,128 +97,128 @@ fn build_sentance_event(text: String, timing_seconds: f64, is_final: bool) -> Se
     }
 }
 
-// newer_transcript is a trancscipt generated from the latest audio chunk
-// older_transcript is a transcript generated from generally the same audio chunk but a bit older (value in the begging is older, )
-// while doing sliding widndows both transcript have the same middle part at least
 fn generate_new_sentance_events(
     newer_transcript: String,
-    older_transcript: String,
+    current_sentances: &mut Vec<String>,
     timing_seconds: f64,
 ) -> Vec<SentanceEvent> {
-    let mut events: Vec<SentanceEvent> = Vec::new();
-
-    let new_text = newer_transcript.trim().to_string();
-    let old_text = older_transcript.trim().to_string();
-
-    if new_text == old_text {
-        return events;
+    let newer_sentances = split_transcript_into_sentances(newer_transcript);
+    let last_sentance_opt = newer_sentances.last().cloned();
+    let old_last_opt = current_sentances.last().cloned();
+    let old_pre_last_opt = current_sentances
+        .len()
+        .checked_sub(2)
+        .and_then(|idx| current_sentances.get(idx))
+        .cloned();
+    if let Some(last_sentance) = last_sentance_opt {
+        if let Some(old_last) = old_last_opt {
+            let is_common_middle = common_middle_part(last_sentance.clone(), old_last.clone());
+            if is_common_middle {
+                return vec![build_sentance_event(
+                    last_sentance.clone(),
+                    timing_seconds,
+                    false,
+                )];
+            } else if let Some(old_pre_last) = old_pre_last_opt {
+                current_sentances.push(last_sentance.clone());
+                return vec![
+                    build_sentance_event(old_pre_last.clone(), timing_seconds, true),
+                    build_sentance_event(last_sentance.clone(), timing_seconds, false),
+                ];
+            } else {
+                current_sentances.push(last_sentance.clone());
+                return vec![build_sentance_event(
+                    last_sentance.clone(),
+                    timing_seconds,
+                    false,
+                )];
+            }
+        } else {
+            current_sentances.push(last_sentance.clone());
+            return vec![build_sentance_event(
+                last_sentance.clone(),
+                timing_seconds,
+                false,
+            )];
+        }
     }
-
-    fn is_sentence_end(s: &str) -> bool {
-        s.chars()
-            .rev()
-            .find(|c| !c.is_whitespace())
-            .map(|c| matches!(c, '.' | '!' | '?' | '…'))
-            .unwrap_or(false)
-    }
-
-    // Basic behavior: emit updated text. Mark final if it appears to complete a sentence.
-    let is_final = is_sentence_end(&new_text);
-    events.push(build_sentance_event(new_text, timing_seconds, is_final));
-    events
+    Vec::new()
 }
 
-// Exmple 1
-// older_transcript: "Hello, how are you doing?"
-// newer_transcript: "Hello, how are you doing? I'm doing well, thank you."
-// return: ("", "Hello, how are you doing?", "I'm doing well, thank you.")
-// Exmple 2
-// older_transcript: "What a nice day. Hello, how are you doing?"
-// newer_transcript: "What a nice day. Hello, how are you doing? I'm doing well, thank you."
-// return: ("What a nice day.", "Hello, how are you doing?", "I'm doing well, thank you.")
-// General case:
-// The first string returned is one thats is in the start of older_transcript and not in the start of newer_transcript
-// The second string returned is common part of the start of older_transcript and newer_transcript(usually located in the middle)
-// And the third string returned is one thats is in the end of newer_transcript and not in the end of older_transcript
-fn diff_start_common_part_diff_end(
-    newer_transcript: String,
-    older_transcript: String,
-) -> (String, String, String) {
-    let newer = newer_transcript.trim();
-    let older = older_transcript.trim();
-
-    // Helper: find last sentence boundary start index in `older` (position of the first char of the last sentence)
-    fn last_sentence_start_index(s: &str) -> Option<usize> {
-        // Find last punctuation among . ! ? … and then skip following spaces
-        let mut last_punct_byte_idx: Option<usize> = None;
-        for (i, ch) in s.char_indices() {
-            if matches!(ch, '.' | '!' | '?' | '…') {
-                last_punct_byte_idx = Some(i);
-            }
+// returns if the two strings have the same middle part that is more than one character(not including spaces)
+fn common_middle_part(new: String, old: String) -> bool {
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    let mut sim_streak = 0;
+    loop {
+        let new_char = new.chars().nth(new_idx);
+        let old_char = old.chars().nth(old_idx);
+        if new_char.is_none() || old_char.is_none() {
+            return false;
         }
-        let punct_idx = last_punct_byte_idx?;
-        // Advance to first non-space after punctuation
-        let mut idx = punct_idx
-            + s[punct_idx..]
-                .chars()
-                .next()
-                .map(|c| c.len_utf8())
-                .unwrap_or(1);
-        for (off, ch) in s[idx..].char_indices() {
-            if !ch.is_whitespace() {
-                idx += off;
-                return Some(idx);
-            }
-        }
-        // No non-space after punctuation -> no last sentence start
-        None
-    }
-
-    // Preferred split: use the last sentence in `older` as the common part if the newer text contains it
-    if let Some(start_idx) = last_sentence_start_index(older) {
-        if start_idx < older.len() {
-            let common_candidate = older[start_idx..].trim_start();
-            if !common_candidate.is_empty() {
-                if let Some(pos) = newer.find(common_candidate) {
-                    let start_diff = older[..start_idx].trim_end().to_string();
-                    let common = common_candidate.to_string();
-                    let mut end_diff = String::new();
-                    let after = pos + common_candidate.len();
-                    if after <= newer.len() {
-                        end_diff = newer[after..].trim_start().to_string();
-                    }
-                    return (start_diff, common, end_diff);
+        let new_char = new_char.unwrap();
+        let old_char = old_char.unwrap();
+        if new_char == old_char {
+            new_idx += 1;
+            old_idx += 1;
+            if !new_char.is_whitespace() {
+                sim_streak += 1;
+                if sim_streak > 1 {
+                    return true;
                 }
             }
+        } else {
+            old_idx += 1;
+            sim_streak = 0;
         }
     }
-
-    // Fallback: use the longest suffix of `older` that is a prefix of `newer`
-    let older_bytes = older.as_bytes();
-    let newer_bytes = newer.as_bytes();
-    let max_k = older_bytes.len().min(newer_bytes.len());
-    let mut overlap_len = 0usize;
-    for k in (1..=max_k).rev() {
-        if &older_bytes[older_bytes.len() - k..] == &newer_bytes[..k] {
-            overlap_len = k;
-            break;
-        }
-    }
-
-    if overlap_len == 0 {
-        // No overlap
-        return (older.to_string(), String::new(), newer.to_string());
-    }
-
-    // Convert byte indexes to string slices
-    let start_idx = older.len() - overlap_len;
-    let start_diff = older[..start_idx].trim_end().to_string();
-    let common = older[start_idx..].to_string();
-    let end_diff = newer[overlap_len..].trim_start().to_string();
-    (start_diff, common, end_diff)
 }
 
-#[derive(Serialize, Clone)]
+// Example: "Hello, how are you? I'm doing well, thank you." -> ["Hello, how are you?", "I'm doing well, thank you."]
+// Example: "'...open other facilities, rare earth buildings,' was split into ["...open other facilities, rare earth buildings,"]
+// Just a '.' or '?' or '!' or '…' is enough to split the sentance
+fn split_transcript_into_sentances(transcript: String) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    // Match minimally up to a sentence terminator (. ? ! …), then include any trailing closing quotes/brackets
+    // Use DOTALL so we can span across newlines if present
+    let re = Regex::new(r#"(?s)\s*(.+?[\.!\?…]+(?:[\"'”’»)\]}]+)?)"#).expect("invalid regex");
+
+    let mut last_end: usize = 0;
+    for caps in re.captures_iter(&transcript) {
+        if let Some(m) = caps.get(0) {
+            last_end = m.end();
+        }
+        if let Some(m) = caps.get(1) {
+            let mut s = m.as_str().trim().to_string();
+            if (s.starts_with('"') && s.ends_with('"'))
+                || (s.starts_with('\'') && s.ends_with('\''))
+            {
+                if s.len() >= 2 {
+                    s = s[1..s.len() - 1].to_string();
+                }
+            }
+            if !s.is_empty() {
+                result.push(s);
+            }
+        }
+    }
+
+    let tail = transcript[last_end..].trim();
+    if !tail.is_empty() {
+        let mut s = tail.to_string();
+        if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+            if s.len() >= 2 {
+                s = s[1..s.len() - 1].to_string();
+            }
+        }
+        result.push(s);
+    }
+
+    println!("Transcript: '{}' was split into {:?}", transcript, result);
+    result
+}
+
+#[derive(Serialize, Clone, Debug)]
 struct SentanceEvent {
     text: String,
     timing_ms: f64,
@@ -329,12 +318,16 @@ struct AudioRecordingState {
     audio_buffer: AudioRingBuffer, // Ring buffer for efficient audio storage (already resampled to 16kHz)
     dropped_samples_count: u64,    // Track dropped samples due to buffer overflow
     translated_samples_count: u64, // Track samples that were successfully processed
-    last_event: Option<SentanceEvent>,
+    all_sentances: Vec<String>,
     is_recording: bool,
     stream: Option<SCStream>,
 }
 
 fn init() {
+    // Redirect whisper.cpp & GGML logs into Rust logging hooks; with no backend features enabled,
+    // this effectively silences them from stdout/stderr.
+    whisper_rs::install_logging_hooks();
+
     let mut context_param = WhisperContextParameters::default();
     // Disable DTW token-level timestamps for streaming to avoid median filter assertions on small chunks
     context_param.dtw_parameters.mode = whisper_rs::DtwMode::None;

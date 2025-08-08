@@ -5,7 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const isRecording = ref(false);
 const transcriptEntries = ref<
-  Array<{ text: string; timing: string; timestamp: Date }>
+  Array<{ text: string; timing: string; timestamp: Date; is_final: boolean }>
 >([]);
 const statusMessage = ref("Ready to start recording");
 const isLoading = ref(false);
@@ -33,12 +33,14 @@ onMounted(async () => {
       text: text,
       timing: payload.timing_display,
       timestamp: new Date(),
+      is_final: payload.is_final,
     });
     if (payload.is_final) {
       transcriptEntries.value.push({
         text: "",
         timing: "",
         timestamp: new Date(),
+        is_final: false,
       });
     }
 
@@ -150,6 +152,7 @@ function changeLastTo(entry: {
   text: string;
   timing: string;
   timestamp: Date;
+  is_final: boolean;
 }) {
   if (transcriptEntries.value.length > 0) {
     transcriptEntries.value[transcriptEntries.value.length - 1] = entry;
@@ -242,7 +245,7 @@ function changeLastTo(entry: {
         <div
           v-for="(entry, index) in transcriptEntries"
           :key="index"
-          class="transcript-entry"
+          :class="['transcript-entry', entry.is_final ? 'final' : 'partial']"
         >
           <div class="transcript-text">{{ entry.text }}</div>
           <div class="transcript-timing">{{ entry.timing }}</div>
@@ -499,6 +502,16 @@ h1 {
   border: 1px solid #e8e8e8;
   border-radius: 8px;
   transition: all 0.2s ease;
+}
+
+.transcript-entry.final {
+  border-color: #27ae60;
+  background: #eafaf1;
+}
+
+.transcript-entry.partial {
+  border-color: #f1c40f;
+  background: #fef9e7;
 }
 
 .transcript-entry:hover {
