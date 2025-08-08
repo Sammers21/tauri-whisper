@@ -4312,6 +4312,7 @@ dependencies = [
  "screencapturekit 0.3.6",
  "serde",
  "serde_json",
+ "strsim",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",

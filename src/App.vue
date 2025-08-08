@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from "vue";
+import { ref, onMounted, onUnmounted, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 const isRecording = ref(false);
 const transcriptEntries = ref<
-  Array<{ text: string; timing: string; timestamp: Date; is_final: boolean }>
+  Array<{ text: string; timing: string; timestamp: Date }>
 >([]);
 const statusMessage = ref("Ready to start recording");
 const isLoading = ref(false);
@@ -16,6 +16,14 @@ const translatedSamplesCount = ref(0);
 let unlistenTranscript: UnlistenFn | null = null;
 let droppedSamplesInterval: number | null = null;
 
+const lastFilledIndex = computed(() => {
+  for (let i = transcriptEntries.value.length - 1; i >= 0; i--) {
+    const e = transcriptEntries.value[i];
+    if (e && e.text && e.text.trim().length > 0) return i;
+  }
+  return -1;
+});
+
 onMounted(async () => {
   // Listen for real-time sentance events
   unlistenTranscript = await listen("sentance", (event) => {
@@ -23,26 +31,17 @@ onMounted(async () => {
       text: string;
       timing_ms: number;
       timing_display: string;
-      is_final: boolean;
+      index: number;
     };
     const text = payload?.text?.trim();
     if (!text) return;
 
     lastTranscriptionTime.value = payload.timing_display;
-    changeLastTo({
+    updateEntryAtIndex(payload.index, {
       text: text,
       timing: payload.timing_display,
       timestamp: new Date(),
-      is_final: payload.is_final,
     });
-    if (payload.is_final) {
-      transcriptEntries.value.push({
-        text: "",
-        timing: "",
-        timestamp: new Date(),
-        is_final: false,
-      });
-    }
 
     // Auto-scroll to bottom
     setTimeout(() => {
@@ -148,16 +147,19 @@ async function updateSamplesCounts() {
   ]);
 }
 
-function changeLastTo(entry: {
-  text: string;
-  timing: string;
-  timestamp: Date;
-  is_final: boolean;
-}) {
-  if (transcriptEntries.value.length > 0) {
-    transcriptEntries.value[transcriptEntries.value.length - 1] = entry;
+function updateEntryAtIndex(
+  index: number,
+  entry: { text: string; timing: string; timestamp: Date }
+) {
+  if (index < 0) return;
+  const arr = transcriptEntries.value;
+  if (index < arr.length) {
+    arr[index] = entry;
   } else {
-    transcriptEntries.value.push(entry);
+    for (let i = arr.length; i < index; i++) {
+      arr.push({ text: "", timing: "", timestamp: new Date(0) });
+    }
+    arr.push(entry);
   }
 }
 </script>
@@ -245,8 +247,12 @@ function changeLastTo(entry: {
         <div
           v-for="(entry, index) in transcriptEntries"
           :key="index"
-          :class="['transcript-entry', entry.is_final ? 'final' : 'partial']"
+          :class="[
+            'transcript-entry',
+            index === lastFilledIndex ? 'partial' : 'final',
+          ]"
         >
+          <div class="transcript-index">{{ index }}</div>
           <div class="transcript-text">{{ entry.text }}</div>
           <div class="transcript-timing">{{ entry.timing }}</div>
         </div>
@@ -493,15 +499,31 @@ h1 {
 }
 
 .transcript-entry {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 15px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 12px;
   padding: 10px;
   background: white;
   border: 1px solid #e8e8e8;
   border-radius: 8px;
   transition: all 0.2s ease;
+}
+
+.transcript-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #ecf0f1;
+  border: 1px solid #bdc3c7;
+  font-family: "Courier New", monospace;
+  font-size: 14px;
+  font-weight: 700;
+  color: #2c3e50;
 }
 
 .transcript-entry.final {

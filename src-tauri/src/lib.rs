@@ -6,6 +6,7 @@ use core_foundation::error::CFError;
 use core_media_rs::cm_sample_buffer::CMSampleBuffer;
 use regex::Regex;
 use ringbuf::{HeapRb, Rb};
+use strsim::normalized_levenshtein;
 
 use screencapturekit::{
     shareable_content::SCShareableContent,
@@ -26,7 +27,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 // Constants for audio processing
 const SOURCE_SAMPLE_RATE: u32 = 48000;
 const TARGET_SAMPLE_RATE: u32 = 16000;
-const SLIDING_WINDOW_SIZE: f32 = 60.0;
+const SLIDING_WINDOW_SIZE: f32 = 30.0;
 const RESAMPLE_RATIO: f32 = TARGET_SAMPLE_RATE as f32 / SOURCE_SAMPLE_RATE as f32;
 const WINDOW_SAMPLES: usize = (SLIDING_WINDOW_SIZE * TARGET_SAMPLE_RATE as f32) as usize;
 
@@ -88,12 +89,12 @@ fn process_sample_buffer(sample_buffer: &CMSampleBuffer) {
     }
 }
 
-fn build_sentance_event(text: String, timing_seconds: f64, is_final: bool) -> SentanceEvent {
+fn build_sentance_event(text: String, timing_seconds: f64, index: usize) -> SentanceEvent {
     SentanceEvent {
         text,
         timing_ms: timing_seconds * 1000.0,
         timing_display: format_timing(timing_seconds),
-        is_final,
+        index: index,
     }
 }
 
@@ -105,40 +106,42 @@ fn generate_new_sentance_events(
     let newer_sentances = split_transcript_into_sentances(newer_transcript);
     let last_sentance_opt = newer_sentances.last().cloned();
     let old_last_opt = current_sentances.last().cloned();
-    let old_pre_last_opt = current_sentances
-        .len()
-        .checked_sub(2)
-        .and_then(|idx| current_sentances.get(idx))
-        .cloned();
     if let Some(last_sentance) = last_sentance_opt {
         if let Some(old_last) = old_last_opt {
-            let is_common_middle = common_middle_part(last_sentance.clone(), old_last.clone());
+            let (is_common_middle, common_part) =
+                common_middle_part(last_sentance.clone(), old_last.clone());
             if is_common_middle {
+                println!("EMITTING non-final: Last sentance '{}' and old last '{}' have common middle '{}', so we replace the old last with the new one", last_sentance, old_last, common_part);
+                current_sentances.pop();
+                current_sentances.push(last_sentance.clone());
                 return vec![build_sentance_event(
                     last_sentance.clone(),
                     timing_seconds,
-                    false,
+                    current_sentances.len() - 1,
                 )];
-            } else if let Some(old_pre_last) = old_pre_last_opt {
+            } else {
+                println!("EMITTING final and non-final: because the last sentance '{}' and old last '{}' have no common middle, we emit the old last as final and the new last as not final", last_sentance, old_last);
                 current_sentances.push(last_sentance.clone());
                 return vec![
-                    build_sentance_event(old_pre_last.clone(), timing_seconds, true),
-                    build_sentance_event(last_sentance.clone(), timing_seconds, false),
+                    build_sentance_event(
+                        old_last.clone(),
+                        timing_seconds,
+                        current_sentances.len() - 2,
+                    ),
+                    build_sentance_event(
+                        last_sentance.clone(),
+                        timing_seconds,
+                        current_sentances.len() - 1,
+                    ),
                 ];
-            } else {
-                current_sentances.push(last_sentance.clone());
-                return vec![build_sentance_event(
-                    last_sentance.clone(),
-                    timing_seconds,
-                    false,
-                )];
             }
         } else {
+            println!("EMITTING non-final: no old last, so we emit the new last as not final");
             current_sentances.push(last_sentance.clone());
             return vec![build_sentance_event(
                 last_sentance.clone(),
                 timing_seconds,
-                false,
+                current_sentances.len() - 1,
             )];
         }
     }
@@ -146,32 +149,82 @@ fn generate_new_sentance_events(
 }
 
 // returns if the two strings have the same middle part that is more than one character(not including spaces)
-fn common_middle_part(new: String, old: String) -> bool {
-    let mut old_idx = 0;
-    let mut new_idx = 0;
-    let mut sim_streak = 0;
-    loop {
-        let new_char = new.chars().nth(new_idx);
-        let old_char = old.chars().nth(old_idx);
-        if new_char.is_none() || old_char.is_none() {
-            return false;
-        }
-        let new_char = new_char.unwrap();
-        let old_char = old_char.unwrap();
-        if new_char == old_char {
-            new_idx += 1;
-            old_idx += 1;
-            if !new_char.is_whitespace() {
-                sim_streak += 1;
-                if sim_streak > 1 {
-                    return true;
-                }
+fn common_middle_part(new: String, old: String) -> (bool, String) {
+    // Preprocess: lowercase and normalize whitespace/punctuation spacing
+    let preprocess = |s: String| -> String {
+        let lower = s.to_ascii_lowercase();
+        let collapsed_ws = Regex::new(r"\s+").unwrap().replace_all(&lower, " ");
+        collapsed_ws.trim().to_string()
+    };
+
+    let new_p = preprocess(new);
+    let old_p = preprocess(old);
+
+    // Quick return if one is empty
+    if new_p.is_empty() || old_p.is_empty() {
+        return (false, String::new());
+    }
+
+    // Sliding window over old string to find the most similar substring to new
+    // We try substrings of old with lengths around the new length, but allow +/- 25%
+    let new_len = new_p.len();
+    let min_len = (new_len as f32 * 0.5).max(3.0) as usize;
+    let max_len = (new_len as f32 * 1.25) as usize;
+
+    let mut best_score = 0.0f64;
+    let mut best_sub = String::new();
+    let old_chars: Vec<char> = old_p.chars().collect();
+    for start in 0..old_chars.len() {
+        for end in (start + min_len)..=old_chars.len().min(start + max_len) {
+            let cand: String = old_chars[start..end].iter().collect();
+            let score = normalized_levenshtein(&new_p, &cand);
+            if score > best_score {
+                best_score = score;
+                best_sub = cand;
             }
-        } else {
-            old_idx += 1;
-            sim_streak = 0;
         }
     }
+
+    // Also compute a simple longest common substring to extract a tangible common part
+    let lcs = longest_common_substring(&new_p, &old_p);
+
+    // Decide similarity using threshold
+    let is_common = best_score >= 0.75 || (lcs.len() >= 6 && best_score >= 0.6);
+    (is_common, lcs)
+}
+
+fn longest_common_substring(a: &str, b: &str) -> String {
+    if a.is_empty() || b.is_empty() {
+        return String::new();
+    }
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut dp = vec![vec![0u16; b_bytes.len() + 1]; a_bytes.len() + 1];
+    let mut best_len = 0usize;
+    let mut best_end = 0usize;
+
+    for i in 1..=a_bytes.len() {
+        for j in 1..=b_bytes.len() {
+            if a_bytes[i - 1] == b_bytes[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+                if dp[i][j] as usize > best_len {
+                    best_len = dp[i][j] as usize;
+                    best_end = i;
+                }
+            } else {
+                dp[i][j] = 0;
+            }
+        }
+    }
+    a[a.char_indices()
+        .nth(best_end - best_len)
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+        ..a.char_indices()
+            .nth(best_end)
+            .map(|(i, _)| i)
+            .unwrap_or(a.len())]
+        .to_string()
 }
 
 // Example: "Hello, how are you? I'm doing well, thank you." -> ["Hello, how are you?", "I'm doing well, thank you."]
@@ -223,8 +276,7 @@ struct SentanceEvent {
     text: String,
     timing_ms: f64,
     timing_display: String,
-    // if the sentance is final or not
-    is_final: bool,
+    index: usize,
 }
 
 fn format_timing(seconds: f64) -> String {
@@ -499,4 +551,37 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_common_middle_part_today_theyre_producing_vs_today_there() {
+        let new_text = "Today they're producing".to_string();
+        let old_text = "Today there".to_string();
+        let (is_common, common_part) = common_middle_part(new_text, old_text);
+        assert!(
+            !is_common,
+            "expected common middle part to be false; got true with common_part='{}'",
+            common_part
+        );
+    }
+
+    #[test]
+    fn test_common_middle_part_we_re_thrilled_to_work_together_on_a_cutting_edge_rare_earth_recycling_log_vs_we_re_thrilled_to_work_together_on_a_cutting_edge_rare_earth_recycling(
+    ) {
+        let new_text =
+            "We're thrilled to work together on a cutting-edge, rare-earth recycling log"
+                .to_string();
+        let old_text =
+            "We're thrilled to work together on a cutting edge rare earth recycling".to_string();
+        let (is_common, common_part) = common_middle_part(new_text, old_text);
+        assert!(
+            is_common,
+            "expected common middle part to be true; got false with common_part='{}'",
+            common_part
+        );
+    }
 }
