@@ -177,20 +177,28 @@ fn common_middle_part(new: String, old: String) -> (bool, String) {
         new, old, score
     ));
     if score < threshold {
-        // lets cut new and old to the length of the shorter one
-        let min_len = new.len().min(old.len());
-        let new_cut = &new[0..min_len];
-        let old_cut = &old[0..min_len];
-        let score = normalized_levenshtein(new_cut, old_cut);
+        // Compare only up to the shorter length using char boundaries to avoid UTF-8 slicing issues
+        let new_chars_count = new.chars().count();
+        let old_chars_count = old.chars().count();
+        let min_chars = new_chars_count.min(old_chars_count);
+        let new_cut: String = new.chars().take(min_chars).collect();
+        let old_cut: String = old.chars().take(min_chars).collect();
+        let score = normalized_levenshtein(&new_cut, &old_cut);
         explanation.push_str(&format!(
             "CASE 2: The normalized levenshtein score between '{}' and '{}' is {}\n",
             new_cut, old_cut, score
         ));
         if score < threshold {
-            // do the same for the other way around
-            let new_cut_from_end = &new[new.len() - min_len..];
-            let old_cut_from_end = &old[old.len() - min_len..];
-            let score = normalized_levenshtein(new_cut_from_end, old_cut_from_end);
+            // Compare suffixes of equal char length using char-safe slicing
+            let new_cut_from_end: String = new
+                .chars()
+                .skip(new_chars_count.saturating_sub(min_chars))
+                .collect();
+            let old_cut_from_end: String = old
+                .chars()
+                .skip(old_chars_count.saturating_sub(min_chars))
+                .collect();
+            let score = normalized_levenshtein(&new_cut_from_end, &old_cut_from_end);
             explanation.push_str(&format!(
                 "CASE 3: The normalized levenshtein score between '{}' and '{}' is {}\n",
                 new_cut_from_end, old_cut_from_end, score
