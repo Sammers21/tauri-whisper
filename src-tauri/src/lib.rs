@@ -106,43 +106,62 @@ fn generate_new_sentance_events(
     let newer_sentances = split_transcript_into_sentances(newer_transcript);
     let last_sentance_opt = newer_sentances.last().cloned();
     let old_last_opt = current_sentances.last().cloned();
+    // Safely get the pre-last element only if there are at least 2 items
+    let old_pre_last_opt = current_sentances
+        .len()
+        .checked_sub(2)
+        .and_then(|idx| current_sentances.get(idx))
+        .cloned();
     if let Some(last_sentance) = last_sentance_opt {
         if let Some(old_last) = old_last_opt {
-            let (is_common_middle, common_part) =
+            let (is_common_middle, common_part_direct) =
                 common_middle_part(last_sentance.clone(), old_last.clone());
+            let pre_last_plus_last_match = old_pre_last_opt.as_ref().map(|old_pre_last| {
+                common_middle_part(
+                    format!("{} {}", old_pre_last, old_last),
+                    last_sentance.clone(),
+                )
+            });
             if is_common_middle {
-                println!("EMITTING non-final: Last sentance '{}' and old last '{}' have common middle '{}', so we replace the old last with the new one", last_sentance, old_last, common_part);
                 current_sentances.pop();
                 current_sentances.push(last_sentance.clone());
-                return vec![build_sentance_event(
+                let event = build_sentance_event(
                     last_sentance.clone(),
                     timing_seconds,
                     current_sentances.len() - 1,
-                )];
-            } else {
-                println!("EMITTING final and non-final: because the last sentance '{}' and old last '{}' have no common middle, we emit the old last as final and the new last as not final", last_sentance, old_last);
+                );
+                println!("Case 1: new last + old last have common middle '{}', so we replace the old last with the new one", common_part_direct);
+                return vec![event];
+            } else if let Some((true, common_part_combo)) = pre_last_plus_last_match {
+                current_sentances.pop();
+                current_sentances.pop();
                 current_sentances.push(last_sentance.clone());
-                return vec![
-                    build_sentance_event(
-                        old_last.clone(),
-                        timing_seconds,
-                        current_sentances.len() - 2,
-                    ),
-                    build_sentance_event(
-                        last_sentance.clone(),
-                        timing_seconds,
-                        current_sentances.len() - 1,
-                    ),
-                ];
+                let event = build_sentance_event(
+                    last_sentance.clone(),
+                    timing_seconds,
+                    current_sentances.len() - 1,
+                );
+                println!("Case 2: new last + old last+pre_last have common middle '{}', so we replace old last+pre_last with the new one", common_part_combo);
+                return vec![event];
+            } else {
+                current_sentances.push(last_sentance.clone());
+                let event = build_sentance_event(
+                    last_sentance.clone(),
+                    timing_seconds,
+                    current_sentances.len() - 1,
+                );
+                println!("Case 3: new last + old last and old last+pre_last have no common middle, so we emit the new last");
+                return vec![event];
             }
         } else {
-            println!("EMITTING non-final: no old last, so we emit the new last as not final");
             current_sentances.push(last_sentance.clone());
-            return vec![build_sentance_event(
+            let event = build_sentance_event(
                 last_sentance.clone(),
                 timing_seconds,
                 current_sentances.len() - 1,
-            )];
+            );
+            println!("Case 4: no old last, so we emit the new last");
+            return vec![event];
         }
     }
     Vec::new()
@@ -150,14 +169,43 @@ fn generate_new_sentance_events(
 
 // returns if the two strings have the same middle part that is more than one character(not including spaces)
 fn common_middle_part(new: String, old: String) -> (bool, String) {
-    let min_len = old.len().min(new.len());
-    let new_cut = &new[0..min_len];
-    let old_cut = &old[0..min_len];
-    let score = normalized_levenshtein(new_cut, old_cut);
-    (
-        score > 0.75,
-        format!("The normalized levenshtein score is {}", score),
-    )
+    let threshold = 0.75;
+    let mut explanation = String::new();
+    let score = normalized_levenshtein(&new, &old);
+    explanation.push_str(&format!(
+        "CASE 1: The normalized levenshtein score between '{}' and '{}' is {}\n",
+        new, old, score
+    ));
+    if score < threshold {
+        // lets cut new and old to the length of the shorter one
+        let min_len = new.len().min(old.len());
+        let new_cut = &new[0..min_len];
+        let old_cut = &old[0..min_len];
+        let score = normalized_levenshtein(new_cut, old_cut);
+        explanation.push_str(&format!(
+            "CASE 2: The normalized levenshtein score between '{}' and '{}' is {}\n",
+            new_cut, old_cut, score
+        ));
+        if score < threshold {
+            // do the same for the other way around
+            let new_cut_from_end = &new[new.len() - min_len..];
+            let old_cut_from_end = &old[old.len() - min_len..];
+            let score = normalized_levenshtein(new_cut_from_end, old_cut_from_end);
+            explanation.push_str(&format!(
+                "CASE 3: The normalized levenshtein score between '{}' and '{}' is {}\n",
+                new_cut_from_end, old_cut_from_end, score
+            ));
+            if score < threshold {
+                return (false, explanation);
+            } else {
+                return (true, explanation);
+            }
+        } else {
+            return (true, explanation);
+        }
+    } else {
+        return (true, explanation);
+    }
 }
 
 // Example: "Hello, how are you? I'm doing well, thank you." -> ["Hello, how are you?", "I'm doing well, thank you."]
@@ -381,8 +429,8 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let mut state = ctx.create_state().ok()?;
     // Create params optimized for real-time transcription
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-    params.set_translate(true);
-    params.set_language(Some("en"));
+    params.set_translate(false);
+    params.set_language(Some("ru"));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
