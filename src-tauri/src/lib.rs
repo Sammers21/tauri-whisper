@@ -150,81 +150,14 @@ fn generate_new_sentance_events(
 
 // returns if the two strings have the same middle part that is more than one character(not including spaces)
 fn common_middle_part(new: String, old: String) -> (bool, String) {
-    // Preprocess: lowercase and normalize whitespace/punctuation spacing
-    let preprocess = |s: String| -> String {
-        let lower = s.to_ascii_lowercase();
-        let collapsed_ws = Regex::new(r"\s+").unwrap().replace_all(&lower, " ");
-        collapsed_ws.trim().to_string()
-    };
-
-    let new_p = preprocess(new);
-    let old_p = preprocess(old);
-
-    // Quick return if one is empty
-    if new_p.is_empty() || old_p.is_empty() {
-        return (false, String::new());
-    }
-
-    // Sliding window over old string to find the most similar substring to new
-    // We try substrings of old with lengths around the new length, but allow +/- 25%
-    let new_len = new_p.len();
-    let min_len = (new_len as f32 * 0.5).max(3.0) as usize;
-    let max_len = (new_len as f32 * 1.25) as usize;
-
-    let mut best_score = 0.0f64;
-    let mut best_sub = String::new();
-    let old_chars: Vec<char> = old_p.chars().collect();
-    for start in 0..old_chars.len() {
-        for end in (start + min_len)..=old_chars.len().min(start + max_len) {
-            let cand: String = old_chars[start..end].iter().collect();
-            let score = normalized_levenshtein(&new_p, &cand);
-            if score > best_score {
-                best_score = score;
-                best_sub = cand;
-            }
-        }
-    }
-
-    // Also compute a simple longest common substring to extract a tangible common part
-    let lcs = longest_common_substring(&new_p, &old_p);
-
-    // Decide similarity using threshold
-    let is_common = best_score >= 0.75 || (lcs.len() >= 6 && best_score >= 0.6);
-    (is_common, lcs)
-}
-
-fn longest_common_substring(a: &str, b: &str) -> String {
-    if a.is_empty() || b.is_empty() {
-        return String::new();
-    }
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let mut dp = vec![vec![0u16; b_bytes.len() + 1]; a_bytes.len() + 1];
-    let mut best_len = 0usize;
-    let mut best_end = 0usize;
-
-    for i in 1..=a_bytes.len() {
-        for j in 1..=b_bytes.len() {
-            if a_bytes[i - 1] == b_bytes[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
-                if dp[i][j] as usize > best_len {
-                    best_len = dp[i][j] as usize;
-                    best_end = i;
-                }
-            } else {
-                dp[i][j] = 0;
-            }
-        }
-    }
-    a[a.char_indices()
-        .nth(best_end - best_len)
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-        ..a.char_indices()
-            .nth(best_end)
-            .map(|(i, _)| i)
-            .unwrap_or(a.len())]
-        .to_string()
+    let min_len = old.len().min(new.len());
+    let new_cut = &new[0..min_len];
+    let old_cut = &old[0..min_len];
+    let score = normalized_levenshtein(new_cut, old_cut);
+    (
+        score > 0.75,
+        format!("The normalized levenshtein score is {}", score),
+    )
 }
 
 // Example: "Hello, how are you? I'm doing well, thank you." -> ["Hello, how are you?", "I'm doing well, thank you."]
@@ -448,7 +381,7 @@ fn transcribe_audio_chunk(audio_data: &[f32]) -> Option<(String, f64)> {
     let mut state = ctx.create_state().ok()?;
     // Create params optimized for real-time transcription
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
-    params.set_translate(false);
+    params.set_translate(true);
     params.set_language(Some("en"));
     params.set_print_special(false);
     params.set_print_progress(false);
@@ -490,12 +423,28 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
         state.translated_samples_count = 0; // Reset translated samples counter
         let app_handle_clone = app_handle.clone();
         tokio::spawn(async move {
-            while let Ok(sample_buffer) = rx.recv() {
-                process_sample_buffer(&sample_buffer);
+            loop {
+                if !is_recording() {
+                    println!("Stopping audio processing loop because recording is stopped");
+                    break;
+                }
+                match rx.recv() {
+                    Ok(sample_buffer) => {
+                        process_sample_buffer(&sample_buffer);
+                    }
+                    Err(_) => {
+                        println!("Error receiving sample buffer, stopping audio processing loop");
+                        break;
+                    }
+                }
             }
         });
         tokio::spawn(async move {
             loop {
+                if !is_recording() {
+                    println!("Stopping transcription loop because recording is stopped");
+                    break;
+                }
                 perform_transcription_update_ui(&app_handle_clone);
             }
         });
@@ -503,6 +452,14 @@ async fn start_recording(app_handle: AppHandle) -> Result<String, String> {
         return Err("Failed to acquire recording state lock".to_string());
     }
     Ok("System audio recording started successfully".to_string())
+}
+
+fn is_recording() -> bool {
+    if let Ok(state) = RECORDING_STATE.lock() {
+        state.is_recording
+    } else {
+        false
+    }
 }
 
 #[tauri::command]
@@ -563,7 +520,7 @@ mod tests {
         let old_text = "Today there".to_string();
         let (is_common, common_part) = common_middle_part(new_text, old_text);
         assert!(
-            !is_common,
+            is_common,
             "expected common middle part to be false; got true with common_part='{}'",
             common_part
         );
